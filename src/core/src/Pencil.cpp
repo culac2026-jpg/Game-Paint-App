@@ -30,16 +30,18 @@ void drawLine(TiledImage& image, Point a, Point b, Rgba8 color) {
     }
 }
 
-void PencilTool::begin(TiledImage& image, Point p) {
+void PencilTool::begin(TiledImage& image, PointF pos) {
+    const Point p = toPixel(pos);
     image.setPixel(p, color_);
     last_ = p;
 }
 
-void PencilTool::moveTo(TiledImage& image, Point p) {
+void PencilTool::moveTo(TiledImage& image, PointF pos) {
     if (!last_) {
-        begin(image, p);
+        begin(image, pos);
         return;
     }
+    const Point p = toPixel(pos);
     if (p == *last_) {
         return;
     }

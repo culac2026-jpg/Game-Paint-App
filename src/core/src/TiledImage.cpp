@@ -29,25 +29,28 @@ Rgba8 TiledImage::pixel(Point p) const {
     if (!t) {
         return Rgba8::transparent();
     }
-    return t->pixels[static_cast<std::size_t>((p.y % kTileSize) * kTileSize + p.x % kTileSize)];
+    return t->pixels[static_cast<std::size_t>(pixelIndex(p.x, p.y))];
 }
 
 void TiledImage::setPixel(Point p, Rgba8 color) {
     if (!contains(p)) {
         return;
     }
-    const int tx = p.x / kTileSize;
-    const int ty = p.y / kTileSize;
+    editTile(p.x / kTileSize, p.y / kTileSize).pixels[static_cast<std::size_t>(pixelIndex(p.x, p.y))] =
+        color;
+}
+
+TiledImage::Tile& TiledImage::editTile(int tx, int ty) {
     const auto index = static_cast<std::size_t>(tileIndex(tx, ty));
     auto& t = tiles_[index];
     if (!t) {
         t = std::make_unique<Tile>();
     }
-    t->pixels[static_cast<std::size_t>((p.y % kTileSize) * kTileSize + p.x % kTileSize)] = color;
     if (!dirtyFlags_[index]) {
         dirtyFlags_[index] = true;
         dirtyList_.push_back({tx, ty});
     }
+    return *t;
 }
 
 const TiledImage::Tile* TiledImage::tile(int tx, int ty) const {

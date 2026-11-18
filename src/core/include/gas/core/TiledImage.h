@@ -38,6 +38,15 @@ public:
     // Null when the tile has never been written.
     const Tile* tile(int tx, int ty) const;
 
+    // Bulk-write access: allocates the tile if needed and marks it dirty.
+    // tx/ty must be valid tile coordinates.
+    Tile& editTile(int tx, int ty);
+
+    // Index of pixel (x, y) inside its tile's pixel array.
+    static constexpr int pixelIndex(int x, int y) {
+        return (y % kTileSize) * kTileSize + x % kTileSize;
+    }
+
     // Returns tiles written since the last call (tile coordinates), and clears the set.
     std::vector<Point> takeDirtyTiles();
 

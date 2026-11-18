@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.21)
 
 project(GameArtStudio
-    VERSION 0.1.0
+    VERSION 0.2.0
     DESCRIPTION "Desktop editor for 2D game assets"
     LANGUAGES CXX)
 
@@ -12,6 +12,10 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 option(GAS_BUILD_APP   "Build the Qt desktop application" ON)
 option(GAS_BUILD_TESTS "Build unit tests for the core library" ON)
+option(GAS_DEPLOY_RUNTIME "Copy Qt and toolchain DLLs next to the app after each build (Windows)" ON)
+
+# All executables (app + tests) land in build/<preset>/bin.
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 
 # Shared warning flags, linked privately by every first-party target.
 add_library(gas_warnings INTERFACE)
