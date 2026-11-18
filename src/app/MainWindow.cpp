@@ -1,14 +1,22 @@
 #include "MainWindow.h"
 
+#include "LayersPanel.h"
+
 #include <gas/core/Document.h>
+#include <gas/core/ProjectIO.h>
 
 #include <QActionGroup>
+#include <QCloseEvent>
 #include <QColorDialog>
 #include <QDialog>
 #include <QDialogButtonBox>
+#include <QDockWidget>
+#include <QFileDialog>
+#include <QFileInfo>
 #include <QFormLayout>
 #include <QLabel>
 #include <QMenuBar>
+#include <QMessageBox>
 #include <QPainter>
 #include <QPixmap>
 #include <QSignalBlocker>
@@ -57,14 +65,15 @@ QSpinBox* makeSpinBox(QWidget* parent, int min, int max, const QString& suffix, 
 
 int percent(double fraction) { return static_cast<int>(std::lround(fraction * 100.0)); }
 
+// Qt paths are UTF-16; going through wstring keeps non-ASCII names intact on Windows.
+std::filesystem::path toFsPath(const QString& path) { return std::filesystem::path(path.toStdWString()); }
+
+const QString kProjectFilter = QObject::tr("GameArt Studio project (*.gas)");
+
 } // namespace
 
 MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
-    setWindowTitle(QStringLiteral("GameArt Studio %1").arg(QStringLiteral(GAS_VERSION)));
-
-    document_ = std::make_unique<gas::Document>(kDefaultCanvasSize, kDefaultCanvasSize);
     canvas_ = new CanvasWidget(this);
-    canvas_->setDocument(document_.get());
     setCentralWidget(canvas_);
 
     zoomLabel_ = new QLabel(this);
@@ -75,21 +84,42 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     connect(canvas_, &CanvasWidget::viewChanged, this, &MainWindow::updateStatus);
     connect(canvas_, &CanvasWidget::cursorMoved, this, &MainWindow::updateStatus);
     connect(canvas_, &CanvasWidget::foregroundColorChanged, this, &MainWindow::updateColorSwatch);
+    connect(canvas_, &CanvasWidget::documentEdited, this, &MainWindow::onDocumentChanged);
+    connect(canvas_, &CanvasWidget::editRefused, this,
+            [this](const QString& reason) { statusBar()->showMessage(reason, 3000); });
 
     createActions();
     createToolBars();
+    createDocks();
+    setDocument(std::make_unique<gas::Document>(kDefaultCanvasSize, kDefaultCanvasSize), QString());
     selectTool(canvas_->tool());
     updateColorSwatch();
     updateStatus();
 }
 
-MainWindow::~MainWindow() = default;
+MainWindow::~MainWindow() {
+    // Views hold raw pointers into the document; detach them first.
+    canvas_->setDocument(nullptr);
+    layersPanel_->setDocument(nullptr);
+}
 
 void MainWindow::createActions() {
     QMenu* file = menuBar()->addMenu(tr("&File"));
     file->addAction(tr("&New Canvas..."), QKeySequence::New, this, &MainWindow::newCanvas);
+    file->addAction(tr("&Open..."), QKeySequence::Open, this, &MainWindow::open);
+    file->addSeparator();
+    file->addAction(tr("&Save"), QKeySequence::Save, this, &MainWindow::save);
+    file->addAction(tr("Save &As..."), QKeySequence::SaveAs, this, &MainWindow::saveAs);
+    file->addAction(tr("&Export PNG..."), QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_E), this,
+                    &MainWindow::exportPng);
     file->addSeparator();
     file->addAction(tr("E&xit"), QKeySequence::Quit, this, &QWidget::close);
+
+    QMenu* edit = menuBar()->addMenu(tr("&Edit"));
+    undoAction_ = edit->addAction(tr("&Undo"), this, &MainWindow::undo);
+    undoAction_->setShortcut(QKeySequence::Undo);
+    redoAction_ = edit->addAction(tr("&Redo"), this, &MainWindow::redo);
+    redoAction_->setShortcuts({QKeySequence(Qt::CTRL | Qt::Key_Y), QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_Z)});
 
     QMenu* view = menuBar()->addMenu(tr("&View"));
     view->addAction(tr("Zoom &In"), QKeySequence::ZoomIn, canvas_, &CanvasWidget::zoomIn);
@@ -204,6 +234,9 @@ void MainWindow::adjustBrushSize(double factor) {
 }
 
 void MainWindow::newCanvas() {
+    if (!maybeSave()) {
+        return;
+    }
     QDialog dialog(this);
     dialog.setWindowTitle(tr("New Canvas"));
     auto* width = new QSpinBox(&dialog);
@@ -227,11 +260,159 @@ void MainWindow::newCanvas() {
     if (dialog.exec() != QDialog::Accepted) {
         return;
     }
-    // Detach the canvas before the old document is destroyed.
-    auto next = std::make_unique<gas::Document>(width->value(), height->value());
-    canvas_->setDocument(next.get());
-    document_ = std::move(next);
-    canvas_->zoomToFit();
+    setDocument(std::make_unique<gas::Document>(width->value(), height->value()), QString());
+}
+
+void MainWindow::createDocks() {
+    layersPanel_ = new LayersPanel(this);
+    auto* dock = new QDockWidget(tr("Layers"), this);
+    dock->setObjectName(QStringLiteral("layersDock"));
+    dock->setFeatures(QDockWidget::DockWidgetMovable | QDockWidget::DockWidgetFloatable);
+    dock->setWidget(layersPanel_);
+    dock->setMinimumWidth(220);
+    addDockWidget(Qt::RightDockWidgetArea, dock);
+    // Queued: the panel's own item signals must finish before it rebuilds its list.
+    connect(layersPanel_, &LayersPanel::documentChanged, this, &MainWindow::onDocumentChanged,
+            Qt::QueuedConnection);
+}
+
+void MainWindow::setDocument(std::unique_ptr<gas::Document> document, const QString& path) {
+    // Point the views at the new document before the old one is destroyed.
+    canvas_->setDocument(document.get());
+    layersPanel_->setDocument(document.get());
+    document_ = std::move(document);
+    filePath_ = path;
+    onDocumentChanged();
+}
+
+void MainWindow::onDocumentChanged() {
+    const QString name = filePath_.isEmpty() ? tr("Untitled") : QFileInfo(filePath_).fileName();
+    setWindowTitle(QStringLiteral("%1[*] - GameArt Studio %2").arg(name, QStringLiteral(GAS_VERSION)));
+    setWindowModified(document_->isModified());
+
+    undoAction_->setEnabled(document_->canUndo());
+    undoAction_->setText(document_->canUndo()
+                             ? tr("&Undo %1").arg(QString::fromStdString(document_->undoLabel()))
+                             : tr("&Undo"));
+    redoAction_->setEnabled(document_->canRedo());
+    redoAction_->setText(document_->canRedo()
+                             ? tr("&Redo %1").arg(QString::fromStdString(document_->redoLabel()))
+                             : tr("&Redo"));
+    layersPanel_->refresh();
+    canvas_->update();
+}
+
+void MainWindow::undo() {
+    if (!canvas_->isBusy() && document_->undo()) {
+        onDocumentChanged();
+    }
+}
+
+void MainWindow::redo() {
+    if (!canvas_->isBusy() && document_->redo()) {
+        onDocumentChanged();
+    }
+}
+
+bool MainWindow::maybeSave() {
+    if (!document_ || !document_->isModified()) {
+        return true;
+    }
+    const QString name = filePath_.isEmpty() ? tr("Untitled") : QFileInfo(filePath_).fileName();
+    const auto choice = QMessageBox::warning(
+        this, tr("Unsaved Changes"), tr("Save changes to \"%1\" before closing?").arg(name),
+        QMessageBox::Save | QMessageBox::Discard | QMessageBox::Cancel, QMessageBox::Save);
+    if (choice == QMessageBox::Save) {
+        return save();
+    }
+    return choice == QMessageBox::Discard;
+}
+
+void MainWindow::open() {
+    if (!maybeSave()) {
+        return;
+    }
+    const QString path = QFileDialog::getOpenFileName(this, tr("Open Project"), QFileInfo(filePath_).path(),
+                                                      kProjectFilter);
+    if (!path.isEmpty()) {
+        openFile(path);
+    }
+}
+
+bool MainWindow::openFile(const QString& path) {
+    gas::LoadResult result = gas::loadProject(toFsPath(path));
+    if (!result.document) {
+        QMessageBox::warning(this, tr("Open Failed"),
+                             tr("Could not open \"%1\":\n%2")
+                                 .arg(QFileInfo(path).fileName(), QString::fromStdString(result.error)));
+        return false;
+    }
+    setDocument(std::move(result.document), path);
+    statusBar()->showMessage(tr("Opened %1").arg(QFileInfo(path).fileName()), 3000);
+    return true;
+}
+
+bool MainWindow::save() { return filePath_.isEmpty() ? saveAs() : saveTo(filePath_); }
+
+bool MainWindow::saveAs() {
+    QString path = QFileDialog::getSaveFileName(
+        this, tr("Save Project As"), filePath_.isEmpty() ? tr("Untitled.gas") : filePath_, kProjectFilter);
+    if (path.isEmpty()) {
+        return false;
+    }
+    if (!path.endsWith(QLatin1String(gas::kProjectExtension), Qt::CaseInsensitive)) {
+        path += QLatin1String(gas::kProjectExtension);
+    }
+    return saveTo(path);
+}
+
+bool MainWindow::saveTo(const QString& path) {
+    if (canvas_->isBusy()) {
+        return false;
+    }
+    const gas::IoResult result = gas::saveProject(*document_, toFsPath(path));
+    if (!result.ok) {
+        QMessageBox::warning(this, tr("Save Failed"),
+                             tr("Could not save \"%1\":\n%2")
+                                 .arg(QFileInfo(path).fileName(), QString::fromStdString(result.error)));
+        return false;
+    }
+    filePath_ = path;
+    document_->markSaved();
+    onDocumentChanged();
+    statusBar()->showMessage(tr("Saved %1").arg(QFileInfo(path).fileName()), 3000);
+    return true;
+}
+
+void MainWindow::exportPng() {
+    QString suggested = filePath_.isEmpty() ? tr("Untitled.png") : filePath_;
+    if (suggested.endsWith(QLatin1String(gas::kProjectExtension), Qt::CaseInsensitive)) {
+        suggested.chop(static_cast<int>(std::char_traits<char>::length(gas::kProjectExtension)));
+        suggested += QStringLiteral(".png");
+    }
+    QString path = QFileDialog::getSaveFileName(this, tr("Export PNG"), suggested, tr("PNG image (*.png)"));
+    if (path.isEmpty()) {
+        return;
+    }
+    if (!path.endsWith(QStringLiteral(".png"), Qt::CaseInsensitive)) {
+        path += QStringLiteral(".png");
+    }
+    const gas::IoResult result = gas::exportPng(*document_, toFsPath(path));
+    if (!result.ok) {
+        QMessageBox::warning(this, tr("Export Failed"),
+                             tr("Could not export \"%1\":\n%2")
+                                 .arg(QFileInfo(path).fileName(), QString::fromStdString(result.error)));
+        return;
+    }
+    statusBar()->showMessage(tr("Exported %1").arg(QFileInfo(path).fileName()), 3000);
+}
+
+void MainWindow::closeEvent(QCloseEvent* event) {
+    if (maybeSave()) {
+        event->accept();
+    } else {
+        event->ignore();
+    }
 }
 
 void MainWindow::chooseColor() {

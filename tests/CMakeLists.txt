@@ -17,8 +17,11 @@ add_executable(gas_core_tests
     BlendTest.cpp
     BrushTest.cpp
     FillTest.cpp
+    DocumentTest.cpp
+    ProjectIOTest.cpp
 )
-target_link_libraries(gas_core_tests PRIVATE gas::core gas_warnings GTest::gtest_main)
+find_package(ZLIB REQUIRED) # the PNG test decodes with zlib directly
+target_link_libraries(gas_core_tests PRIVATE gas::core gas_warnings GTest::gtest_main ZLIB::ZLIB)
 
 include(GoogleTest)
 gtest_discover_tests(gas_core_tests)

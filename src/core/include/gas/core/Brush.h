@@ -31,8 +31,8 @@ double dabCoverage(double d, double diameter, double hardness);
 // Round brush that stamps dabs along the pointer path.
 //
 // Overlapping dabs never stack: each stroke keeps a coverage mask holding the
-// max coverage seen per pixel, and every touched pixel is recomputed from a
-// snapshot of the image taken when the stroke first reached its tile. So one
+// max coverage seen per pixel, and every touched pixel is recomputed from the
+// (copy-on-write shared) tile as it was when the stroke first reached it. So one
 // stroke never exceeds `opacity`, however often it crosses itself.
 class BrushTool : public StrokeTool {
 public:
@@ -54,7 +54,7 @@ public:
 private:
     using Mask = std::array<float, TiledImage::kTileSize * TiledImage::kTileSize>;
     struct StrokeTile {
-        std::unique_ptr<TiledImage::Tile> original; // null = was transparent
+        TiledImage::TilePtr original; // shared copy-on-write; null = was transparent
         std::unique_ptr<Mask> mask;
     };
 

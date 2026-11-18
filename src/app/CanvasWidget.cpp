@@ -41,12 +41,48 @@ gas::PointF fromQt(QPointF p) { return {p.x(), p.y()}; }
 
 } // namespace
 
-CanvasWidget::CanvasWidget(QWidget* parent) : QOpenGLWidget(parent) {
+CanvasWidget::CanvasWidget(QWidget* parent)
+    : QOpenGLWidget(parent), scratchTile_(std::make_unique<gas::TiledImage::Tile>()) {
     setMouseTracking(true);
     setFocusPolicy(Qt::StrongFocus);
     eraser_.settings().diameter = 24.0;
     setForegroundColor(foreground_);
     updateCursorShape();
+}
+
+static QString toolLabel(Tool tool) {
+    switch (tool) {
+    case Tool::Pencil: return CanvasWidget::tr("Pencil");
+    case Tool::Brush: return CanvasWidget::tr("Brush");
+    case Tool::Eraser: return CanvasWidget::tr("Eraser");
+    case Tool::Fill: return CanvasWidget::tr("Fill");
+    case Tool::Eyedropper: return CanvasWidget::tr("Eyedropper");
+    }
+    return {};
+}
+
+// Starts an undoable edit of the active layer, or explains why it can't.
+gas::TiledImage* CanvasWidget::beginEdit() {
+    gas::TiledImage* img = document_->beginEdit();
+    if (!img) {
+        const gas::LayerProps& p = document_->activeLayer().props;
+        Q_EMIT editRefused(p.locked ? tr("\"%1\" is locked").arg(QString::fromStdString(p.name))
+                                    : tr("\"%1\" is hidden").arg(QString::fromStdString(p.name)));
+    }
+    return img;
+}
+
+void CanvasWidget::finishStroke() {
+    if (!editImage_) {
+        return;
+    }
+    if (gas::StrokeTool* active = strokeTool()) {
+        active->end();
+    }
+    editImage_ = nullptr;
+    if (document_->endEdit(toolLabel(tool_).toStdString())) {
+        Q_EMIT documentEdited();
+    }
 }
 
 gas::StrokeTool* CanvasWidget::strokeTool() {
@@ -61,9 +97,7 @@ gas::StrokeTool* CanvasWidget::strokeTool() {
 }
 
 void CanvasWidget::setTool(Tool tool) {
-    if (gas::StrokeTool* active = strokeTool()) {
-        active->end();
-    }
+    finishStroke();
     picking_ = false;
     tool_ = tool;
     updateCursorShape();
@@ -81,25 +115,16 @@ gas::BrushSettings& CanvasWidget::brushSettings(Tool tool) {
 }
 
 void CanvasWidget::setDocument(gas::Document* document) {
-    if (gas::StrokeTool* active = strokeTool()) {
-        active->end();
+    if (document_) {
+        finishStroke();
     }
+    picking_ = false;
     document_ = document;
     tileCache_.clear();
     if (document_) {
-        // Drop stale dirty state, then cache every tile that already has pixels.
-        document_->image().takeDirtyTiles();
-        const auto& img = document_->image();
-        for (int ty = 0; ty < img.tilesY(); ++ty) {
-            for (int tx = 0; tx < img.tilesX(); ++tx) {
-                cacheTile(tx, ty);
-            }
-        }
+        document_->markAllDirty(); // rebuilt on the next paint
     }
-    fitPending_ = true;
-    if (width() > 0 && height() > 0 && isVisible()) {
-        zoomToFit();
-    }
+    zoomToFit(); // defers itself until the widget has a real size
     update();
 }
 
@@ -118,6 +143,10 @@ void CanvasWidget::zoomActual() {
 
 void CanvasWidget::zoomToFit() {
     if (!document_) {
+        return;
+    }
+    if (!isVisible() || width() <= 1 || height() <= 1) {
+        fitPending_ = true; // not laid out yet; resizeGL() fits once the real size is known
         return;
     }
     viewport_.fit(document_->width(), document_->height(), width(), height());
@@ -139,16 +168,14 @@ void CanvasWidget::resizeGL(int w, int h) {
 }
 
 void CanvasWidget::cacheTile(int tx, int ty) {
-    const auto& img = document_->image();
-    const gas::TiledImage::Tile* tile = img.tile(tx, ty);
-    if (!tile) {
+    if (!document_->compositeTile(tx, ty, *scratchTile_)) {
         tileCache_.remove(tileKey(tx, ty));
         return;
     }
     // Edge tiles are cropped so nothing outside the document gets drawn.
-    const int w = std::min(kTile, img.width() - tx * kTile);
-    const int h = std::min(kTile, img.height() - ty * kTile);
-    const QImage view(reinterpret_cast<const uchar*>(tile->pixels.data()), kTile, kTile,
+    const int w = std::min(kTile, document_->width() - tx * kTile);
+    const int h = std::min(kTile, document_->height() - ty * kTile);
+    const QImage view(reinterpret_cast<const uchar*>(scratchTile_->pixels.data()), kTile, kTile,
                       kTile * static_cast<int>(sizeof(gas::Rgba8)), QImage::Format_RGBA8888);
     tileCache_.insert(tileKey(tx, ty), view.copy(0, 0, w, h));
 }
@@ -157,7 +184,7 @@ void CanvasWidget::syncDirtyTiles() {
     if (!document_) {
         return;
     }
-    for (const gas::Point& t : document_->image().takeDirtyTiles()) {
+    for (const gas::Point& t : document_->takeDirtyTiles()) {
         cacheTile(t.x, t.y);
     }
 }
@@ -192,11 +219,10 @@ void CanvasWidget::paintGL() {
 
     const gas::PointF docMin = viewport_.screenToDoc(fromQt(visible.topLeft()));
     const gas::PointF docMax = viewport_.screenToDoc(fromQt(visible.bottomRight()));
-    const auto& img = document_->image();
     const int tx0 = std::max(0, static_cast<int>(std::floor(docMin.x / kTile)));
     const int ty0 = std::max(0, static_cast<int>(std::floor(docMin.y / kTile)));
-    const int tx1 = std::min(img.tilesX() - 1, static_cast<int>(std::floor(docMax.x / kTile)));
-    const int ty1 = std::min(img.tilesY() - 1, static_cast<int>(std::floor(docMax.y / kTile)));
+    const int tx1 = std::min(document_->tilesX() - 1, static_cast<int>(std::floor(docMax.x / kTile)));
+    const int ty1 = std::min(document_->tilesY() - 1, static_cast<int>(std::floor(docMax.y / kTile)));
     for (int ty = ty0; ty <= ty1; ++ty) {
         for (int tx = tx0; tx <= tx1; ++tx) {
             const auto it = tileCache_.constFind(tileKey(tx, ty));
@@ -235,12 +261,16 @@ gas::PointF CanvasWidget::docAt(QPointF widgetPos) const {
     return viewport_.screenToDoc(fromQt(widgetPos));
 }
 
+// Samples the composite of all visible layers, ignoring fully transparent pixels.
 void CanvasWidget::pickColorAt(QPointF widgetPos) {
-    if (const auto c = gas::pickColor(document_->image(), pixelAt(widgetPos))) {
-        if (*c != foreground_) {
-            setForegroundColor(*c);
-            Q_EMIT foregroundColorChanged(*c);
-        }
+    const gas::Point p = pixelAt(widgetPos);
+    if (p.x < 0 || p.y < 0 || p.x >= document_->width() || p.y >= document_->height()) {
+        return;
+    }
+    const gas::Rgba8 c = document_->compositePixel(p);
+    if (c.a != 0 && c != foreground_) {
+        setForegroundColor(c);
+        Q_EMIT foregroundColorChanged(c);
     }
 }
 
@@ -259,14 +289,22 @@ void CanvasWidget::mousePressEvent(QMouseEvent* event) {
     }
     switch (tool_) {
     case Tool::Fill:
-        gas::floodFill(document_->image(), pixelAt(event->position()), foreground_, fillTolerance_);
+        if (gas::TiledImage* img = beginEdit()) {
+            gas::floodFill(*img, pixelAt(event->position()), foreground_, fillTolerance_);
+            if (document_->endEdit(toolLabel(tool_).toStdString())) {
+                Q_EMIT documentEdited();
+            }
+        }
         break;
     case Tool::Eyedropper:
         picking_ = true;
         pickColorAt(event->position());
         break;
     default:
-        strokeTool()->begin(document_->image(), docAt(event->position()));
+        if (gas::TiledImage* img = beginEdit()) {
+            editImage_ = img;
+            strokeTool()->begin(*img, docAt(event->position()));
+        }
         break;
     }
     update();
@@ -276,7 +314,8 @@ void CanvasWidget::mouseMoveEvent(QMouseEvent* event) {
     cursorPos_ = event->position();
     if (document_) {
         const gas::Point px = pixelAt(event->position());
-        cursorPixel_ = document_->image().contains(px) ? std::optional(px) : std::nullopt;
+        const bool inside = px.x >= 0 && px.y >= 0 && px.x < document_->width() && px.y < document_->height();
+        cursorPixel_ = inside ? std::optional(px) : std::nullopt;
         Q_EMIT cursorMoved();
     }
 
@@ -286,8 +325,8 @@ void CanvasWidget::mouseMoveEvent(QMouseEvent* event) {
         viewport_.panBy(delta.x(), delta.y());
     } else if (picking_ && document_) {
         pickColorAt(event->position());
-    } else if (gas::StrokeTool* active = strokeTool(); active && active->isStroking() && document_) {
-        active->moveTo(document_->image(), docAt(event->position()));
+    } else if (editImage_) {
+        strokeTool()->moveTo(*editImage_, docAt(event->position()));
     }
     update(); // also repaints the brush outline
 }
@@ -301,9 +340,7 @@ void CanvasWidget::mouseReleaseEvent(QMouseEvent* event) {
     }
     if (event->button() == Qt::LeftButton) {
         picking_ = false;
-        if (gas::StrokeTool* active = strokeTool()) {
-            active->end();
-        }
+        finishStroke();
     }
 }
 

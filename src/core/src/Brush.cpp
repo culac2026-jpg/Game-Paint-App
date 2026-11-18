@@ -76,9 +76,7 @@ void BrushTool::end() {
 BrushTool::StrokeTile& BrushTool::strokeTile(const TiledImage& image, int tx, int ty) {
     auto [it, inserted] = strokeTiles_.try_emplace(tileKey(tx, ty));
     if (inserted) {
-        if (const TiledImage::Tile* current = image.tile(tx, ty)) {
-            it->second.original = std::make_unique<TiledImage::Tile>(*current);
-        }
+        it->second.original = image.sharedTile(tx, ty);
         it->second.mask = std::make_unique<Mask>();
         it->second.mask->fill(0.0f);
     }

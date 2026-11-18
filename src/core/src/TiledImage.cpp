@@ -40,17 +40,30 @@ void TiledImage::setPixel(Point p, Rgba8 color) {
         color;
 }
 
-TiledImage::Tile& TiledImage::editTile(int tx, int ty) {
+void TiledImage::markDirty(int tx, int ty) {
     const auto index = static_cast<std::size_t>(tileIndex(tx, ty));
-    auto& t = tiles_[index];
-    if (!t) {
-        t = std::make_unique<Tile>();
-    }
     if (!dirtyFlags_[index]) {
         dirtyFlags_[index] = true;
         dirtyList_.push_back({tx, ty});
     }
+}
+
+TiledImage::Tile& TiledImage::editTile(int tx, int ty) {
+    auto& t = tiles_[static_cast<std::size_t>(tileIndex(tx, ty))];
+    if (!t) {
+        t = std::make_shared<Tile>();
+    } else if (t.use_count() > 1) {
+        t = std::make_shared<Tile>(*t); // copy-on-write
+    }
+    markDirty(tx, ty);
     return *t;
+}
+
+void TiledImage::setTile(int tx, int ty, TilePtr tile) {
+    // Safe: a tile reachable through a TilePtr is shared, so editTile() clones
+    // it before any write.
+    tiles_[static_cast<std::size_t>(tileIndex(tx, ty))] = std::const_pointer_cast<Tile>(std::move(tile));
+    markDirty(tx, ty);
 }
 
 const TiledImage::Tile* TiledImage::tile(int tx, int ty) const {
@@ -58,6 +71,17 @@ const TiledImage::Tile* TiledImage::tile(int tx, int ty) const {
         return nullptr;
     }
     return tiles_[static_cast<std::size_t>(tileIndex(tx, ty))].get();
+}
+
+TiledImage::TilePtr TiledImage::sharedTile(int tx, int ty) const {
+    if (tx < 0 || ty < 0 || tx >= tilesX_ || ty >= tilesY_) {
+        return nullptr;
+    }
+    return tiles_[static_cast<std::size_t>(tileIndex(tx, ty))];
+}
+
+std::vector<TiledImage::TilePtr> TiledImage::snapshot() const {
+    return {tiles_.begin(), tiles_.end()};
 }
 
 std::vector<Point> TiledImage::takeDirtyTiles() {

@@ -46,6 +46,39 @@ TEST(TiledImage, OutOfBoundsIsIgnored) {
     EXPECT_TRUE(img.takeDirtyTiles().empty());
 }
 
+TEST(TiledImage, CopiesShareTilesCopyOnWrite) {
+    TiledImage a(300, 300);
+    a.setPixel({1, 1}, Rgba8::black());
+    TiledImage b = a;
+    EXPECT_EQ(a.tile(0, 0), b.tile(0, 0)); // shared, not copied
+
+    b.setPixel({2, 2}, Rgba8{9, 9, 9, 255});
+    EXPECT_NE(a.tile(0, 0), b.tile(0, 0));
+    EXPECT_EQ(a.pixel({2, 2}), Rgba8::transparent());
+    EXPECT_EQ(b.pixel({1, 1}), Rgba8::black());
+}
+
+TEST(TiledImage, SnapshotStaysUnchangedAfterEdits) {
+    TiledImage img(64, 64);
+    img.setPixel({5, 5}, Rgba8::black());
+    const auto snap = img.snapshot();
+    img.setPixel({5, 5}, Rgba8{1, 2, 3, 255});
+    ASSERT_TRUE(snap[0]);
+    EXPECT_EQ(snap[0]->pixels[TiledImage::pixelIndex(5, 5)], Rgba8::black());
+    EXPECT_EQ(img.pixel({5, 5}), (Rgba8{1, 2, 3, 255}));
+}
+
+TEST(TiledImage, SetTileReplacesAndMarksDirty) {
+    TiledImage img(512, 256);
+    auto tile = std::make_shared<TiledImage::Tile>();
+    tile->pixels[0] = Rgba8::black();
+    img.setTile(1, 0, tile);
+    EXPECT_EQ(img.pixel({256, 0}), Rgba8::black());
+    ASSERT_EQ(img.takeDirtyTiles().size(), 1u);
+    img.setTile(1, 0, nullptr);
+    EXPECT_EQ(img.pixel({256, 0}), Rgba8::transparent());
+}
+
 TEST(TiledImage, DirtyTilesAreUniqueAndDrained) {
     TiledImage img(1024, 1024);
     img.setPixel({1, 1}, Rgba8::black());

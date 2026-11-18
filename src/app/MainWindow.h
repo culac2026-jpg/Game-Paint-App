@@ -10,6 +10,7 @@ namespace gas {
 class Document;
 }
 
+class LayersPanel;
 class QAction;
 class QLabel;
 class QSpinBox;
@@ -22,21 +23,47 @@ public:
     explicit MainWindow(QWidget* parent = nullptr);
     ~MainWindow() override;
 
+    // Opens a project file; returns false (after telling the user) on failure.
+    bool openFile(const QString& path);
+
+protected:
+    void closeEvent(QCloseEvent* event) override;
+
 private:
     void createActions();
     void createToolBars();
+    void createDocks();
     void selectTool(Tool tool);
     void syncToolOptions();
     void adjustBrushSize(double factor);
+
     void newCanvas();
+    void open();
+    bool save();
+    bool saveAs();
+    bool saveTo(const QString& path);
+    void exportPng();
+    // Asks to save unsaved changes; false if the user cancelled.
+    bool maybeSave();
+    void setDocument(std::unique_ptr<gas::Document> document, const QString& path);
+
+    void undo();
+    void redo();
+    // Re-syncs every view of the document (title, undo actions, layers, canvas).
+    void onDocumentChanged();
+
     void chooseColor();
     void updateColorSwatch();
     void updateStatus();
 
     std::unique_ptr<gas::Document> document_;
+    QString filePath_; // empty until saved/opened
     CanvasWidget* canvas_ = nullptr;
+    LayersPanel* layersPanel_ = nullptr;
     QLabel* zoomLabel_ = nullptr;
     QLabel* cursorLabel_ = nullptr;
+    QAction* undoAction_ = nullptr;
+    QAction* redoAction_ = nullptr;
 
     QToolButton* colorButton_ = nullptr;
     QSpinBox* sizeBox_ = nullptr;

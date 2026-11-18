@@ -6,8 +6,11 @@ add_library(gas_core STATIC
     src/Blend.cpp
     src/Brush.cpp
     src/Fill.cpp
+    src/ProjectIO.cpp
 )
 add_library(gas::core ALIAS gas_core)
 
+find_package(ZLIB REQUIRED)
+
 target_include_directories(gas_core PUBLIC include)
-target_link_libraries(gas_core PRIVATE gas_warnings)
+target_link_libraries(gas_core PRIVATE gas_warnings ZLIB::ZLIB)

@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project status
 
-**GameArt Studio** is a Windows desktop editor for 2D game assets (raster painting + vector, pixel art, sprite animation, atlas export to Unity/Cocos Creator). The code is at the **v0.2** milestone: canvas, zoom/pan, Pencil, Brush, Eraser, Fill, Eyedropper. The product/technical plan is `docs/GameArt_Studio_Ke_Hoach_Phat_Trien.docx` (Vietnamese, a proposal rather than a commitment) and is the source of truth for scope.
+**GameArt Studio** is a Windows desktop editor for 2D game assets (raster painting + vector, pixel art, sprite animation, atlas export to Unity/Cocos Creator). The code is at the **v0.3** milestone: canvas, zoom/pan, Pencil, Brush, Eraser, Fill, Eyedropper, layers, undo/redo, project Save/Open, PNG export. The product/technical plan is `docs/GameArt_Studio_Ke_Hoach_Phat_Trien.docx` (Vietnamese, a proposal rather than a commitment) and is the source of truth for scope.
 
 ## Toolchain and commands
 
@@ -27,16 +27,26 @@ GoogleTest 1.15.2 is fetched by `FetchContent` at configure time (or found via `
 
 ## Code layout
 
-- `src/core` → `gas::core` static library, namespace `gas`, headers under `include/gas/core/`. **Must not include Qt or OpenGL.** All tests target this library.
-  - `TiledImage`: sparse 256×256 RGBA tiles (`Rgba8`, straight alpha). Writes allocate the tile and mark it dirty. `takeDirtyTiles()` drains the set.
+- `src/core` → `gas::core` static library, namespace `gas`, headers under `include/gas/core/`. **Must not include Qt or OpenGL.** Its only dependency is zlib. All tests target this library.
+  - `TiledImage`: sparse 256×256 RGBA tiles (`Rgba8`, straight alpha) held as **copy-on-write `shared_ptr`s**. Copying an image or holding `snapshot()`/`sharedTile()` is pointer sharing, and `editTile()` clones a shared tile before writing. Writes mark tiles dirty, and `takeDirtyTiles()` drains the set.
+  - `Document`: layers bottom (index 0) to top, each with `LayerProps` (name, visible, locked, opacity) and a `TiledImage`. **Every change goes through the document** so it's undoable:
+    - Layer methods (`addLayer`, `removeLayer`, `moveLayer`, `setLayerProps`, …) record steps.
+    - Tools draw between `beginEdit()` (returns the active layer's image, or null if it's locked or hidden) and `endEdit(label)`. `endEdit` diffs tile pointers against the snapshot taken at `beginEdit`, so a step stores only the changed tiles.
+    - History is capped by estimated memory (1 GiB by default), dropping the oldest steps first. Consecutive `setLayerProps` on the same layer merge into one step.
+    - `isModified()` compares against `markSaved()`.
+    - Rendering uses `compositeTile`/`compositePixel`/`flatten`, plus `takeDirtyTiles()`, which covers every tile after a structure change.
+  - `ProjectIO`: `.gas` save/load (chunked little-endian binary, zlib-compressed non-empty tiles, CRC-32 trailer, format version, unknown chunks skipped; the layout is documented in `ProjectIO.h`). `exportPng` (a self-contained PNG encoder) and all saves go through `writeFileAtomic` (temp sibling + rename). Bump `kProjectFormatVersion` for incompatible changes.
   - `Viewport`: `screen = doc * zoom + offset`, `zoomAt` keeps the anchor point fixed. Use `toPixel()` (floor) for doc→pixel.
   - `StrokeTool`: the begin/moveTo/end interface for drag tools, taking doc-space `PointF`.
   - `PencilTool` / `drawLine`: Bresenham, overwrites pixels. Each `moveTo` connects to the previous pixel so fast strokes have no gaps.
   - `BrushTool` (Paint or Erase mode): stamps round dabs every `spacing × diameter` px, carrying leftover distance across events. Each stroke keeps a per-tile coverage mask (max, not sum) plus a copy of each tile as it was when the stroke first touched it. Pixels are recomputed from that copy, so one stroke never exceeds its opacity. The same tile snapshots are what v0.3 undo should reuse.
   - `floodFill`: scanline fill, **4-connected** on purpose, so it can't leak through the pencil's 8-connected diagonal lines. `pickColor` ignores fully transparent pixels.
   - `Blend`: `blendOver`, `eraseAlpha`, `colorDistance`.
-  - `Document`: a single raster layer for now (layers/undo/save in v0.3).
-- `src/app`: Qt shell. `CanvasWidget` (a `QOpenGLWidget` painted with `QPainter`) keeps a per-tile `QImage` cache refreshed from `takeDirtyTiles()` on each paint, drawn nearest-neighbour. LMB goes to the active `Tool` (shortcuts N pencil, B brush, E eraser, G fill, I eyedropper; `[`/`]` brush size; C colour). MMB or Space+LMB pans, the wheel zooms at the cursor. `MainWindow` shows per-tool options (size/opacity/hardness, tolerance), and Brush and Eraser keep separate settings. Qt code is built with `QT_NO_KEYWORDS`, so write `Q_SIGNALS`/`Q_EMIT`, not `signals`/`emit`.
+- `src/app`: Qt shell.
+  - `CanvasWidget` (a `QOpenGLWidget` painted with `QPainter`) keeps a per-tile cache of *composited* `QImage`s, refreshed from `Document::takeDirtyTiles()` on each paint and drawn nearest-neighbour. It wraps each stroke in `beginEdit`/`endEdit` and emits `documentEdited`.
+  - `LayersPanel`: dock showing the top layer first.
+  - `MainWindow`: owns the `Document` and the file path. `onDocumentChanged()` re-syncs the title (`[*]` modified marker), Undo/Redo labels, the layers panel and the canvas. Connect anything that edits the document to it. The panel's signal is queued so the list isn't rebuilt inside its own item signal.
+  - Convert paths with `toStdWString()` so Vietnamese file names work. LMB goes to the active `Tool` (shortcuts N pencil, B brush, E eraser, G fill, I eyedropper; `[`/`]` brush size; C colour). MMB or Space+LMB pans, the wheel zooms at the cursor. `MainWindow` shows per-tool options (size/opacity/hardness, tolerance), and Brush and Eraser keep separate settings. Qt code is built with `QT_NO_KEYWORDS`, so write `Q_SIGNALS`/`Q_EMIT`, not `signals`/`emit`.
 - `tests`: GoogleTest, one file per core class.
 
 All first-party targets link the `gas_warnings` interface target (`-Wall -Wextra -Wpedantic -Wconversion -Wshadow`).

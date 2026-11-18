@@ -7,6 +7,8 @@ qt_add_executable(GameArtStudio WIN32
     MainWindow.cpp
     CanvasWidget.h
     CanvasWidget.cpp
+    LayersPanel.h
+    LayersPanel.cpp
 )
 
 target_compile_definitions(GameArtStudio PRIVATE

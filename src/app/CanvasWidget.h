@@ -8,6 +8,7 @@
 #include <QImage>
 #include <QOpenGLWidget>
 
+#include <memory>
 #include <optional>
 
 namespace gas {
@@ -43,6 +44,9 @@ public:
     int fillTolerance() const { return fillTolerance_; }
     void setFillTolerance(int tolerance) { fillTolerance_ = tolerance; }
 
+    // True while a stroke is in progress (undo etc. must wait).
+    bool isBusy() const { return editImage_ != nullptr; }
+
     void zoomIn();
     void zoomOut();
     void zoomActual();
@@ -52,6 +56,10 @@ Q_SIGNALS:
     void viewChanged();
     void cursorMoved();
     void foregroundColorChanged(gas::Rgba8 color);
+    // A tool finished an undoable edit of the document.
+    void documentEdited();
+    // A tool could not run (e.g. the layer is locked); `reason` is user-facing.
+    void editRefused(const QString& reason);
 
 protected:
     void paintGL() override;
@@ -66,6 +74,8 @@ protected:
 
 private:
     gas::StrokeTool* strokeTool();
+    gas::TiledImage* beginEdit();
+    void finishStroke();
     gas::Point pixelAt(QPointF widgetPos) const;
     gas::PointF docAt(QPointF widgetPos) const;
     void pickColorAt(QPointF widgetPos);
@@ -76,8 +86,10 @@ private:
     void updateCursorShape();
 
     gas::Document* document_ = nullptr;
+    gas::TiledImage* editImage_ = nullptr; // active layer during a stroke
     gas::Viewport viewport_;
     QHash<quint64, QImage> tileCache_;
+    std::unique_ptr<gas::TiledImage::Tile> scratchTile_;
     bool fitPending_ = true;
 
     Tool tool_ = Tool::Brush;

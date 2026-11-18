@@ -1,0 +1,176 @@
+#include "LayersPanel.h"
+
+#include <gas/core/Document.h>
+
+#include <QCheckBox>
+#include <QHBoxLayout>
+#include <QLabel>
+#include <QListWidget>
+#include <QSignalBlocker>
+#include <QSpinBox>
+#include <QToolButton>
+#include <QVBoxLayout>
+
+#include <cmath>
+
+namespace {
+
+QToolButton* makeButton(QWidget* parent, const QString& text, const QString& tip) {
+    auto* b = new QToolButton(parent);
+    b->setText(text);
+    b->setToolTip(tip);
+    b->setAutoRaise(true);
+    b->setFocusPolicy(Qt::NoFocus);
+    return b;
+}
+
+} // namespace
+
+LayersPanel::LayersPanel(QWidget* parent) : QWidget(parent) {
+    list_ = new QListWidget(this);
+    list_->setSelectionMode(QAbstractItemView::SingleSelection);
+    list_->setEditTriggers(QAbstractItemView::DoubleClicked | QAbstractItemView::EditKeyPressed);
+
+    opacity_ = new QSpinBox(this);
+    opacity_->setRange(0, 100);
+    opacity_->setSuffix(tr("%"));
+    opacity_->setKeyboardTracking(false);
+    opacity_->setFocusPolicy(Qt::ClickFocus);
+    lock_ = new QCheckBox(tr("Lock"), this);
+    lock_->setFocusPolicy(Qt::NoFocus);
+    lock_->setToolTip(tr("Prevent painting on this layer"));
+
+    auto* props = new QHBoxLayout;
+    props->addWidget(new QLabel(tr("Opacity"), this));
+    props->addWidget(opacity_);
+    props->addStretch();
+    props->addWidget(lock_);
+
+    addButton_ = makeButton(this, tr("New"), tr("New layer"));
+    duplicateButton_ = makeButton(this, tr("Dup"), tr("Duplicate layer"));
+    deleteButton_ = makeButton(this, tr("Del"), tr("Delete layer"));
+    upButton_ = makeButton(this, QStringLiteral("▲"), tr("Move layer up"));
+    downButton_ = makeButton(this, QStringLiteral("▼"), tr("Move layer down"));
+    auto* buttons = new QHBoxLayout;
+    for (QToolButton* b : {addButton_, duplicateButton_, deleteButton_}) {
+        buttons->addWidget(b);
+    }
+    buttons->addStretch();
+    buttons->addWidget(upButton_);
+    buttons->addWidget(downButton_);
+
+    auto* layout = new QVBoxLayout(this);
+    layout->setContentsMargins(4, 4, 4, 4);
+    layout->addLayout(props);
+    layout->addWidget(list_, 1);
+    layout->addLayout(buttons);
+
+    connect(list_, &QListWidget::itemChanged, this, &LayersPanel::onItemChanged);
+    connect(list_, &QListWidget::currentRowChanged, this, &LayersPanel::onCurrentRowChanged);
+    connect(opacity_, &QSpinBox::valueChanged, this, &LayersPanel::setOpacity);
+    connect(lock_, &QCheckBox::toggled, this, &LayersPanel::setLocked);
+    connect(addButton_, &QToolButton::clicked, this, [this] {
+        document_->addLayer();
+        Q_EMIT documentChanged();
+    });
+    connect(duplicateButton_, &QToolButton::clicked, this, [this] {
+        if (document_->duplicateLayer(document_->activeLayerIndex())) {
+            Q_EMIT documentChanged();
+        }
+    });
+    connect(deleteButton_, &QToolButton::clicked, this, [this] {
+        if (document_->removeLayer(document_->activeLayerIndex())) {
+            Q_EMIT documentChanged();
+        }
+    });
+    connect(upButton_, &QToolButton::clicked, this, [this] { moveActive(+1); });
+    connect(downButton_, &QToolButton::clicked, this, [this] { moveActive(-1); });
+
+    setEnabled(false);
+}
+
+void LayersPanel::setDocument(gas::Document* document) {
+    document_ = document;
+    setEnabled(document_ != nullptr);
+    refresh();
+}
+
+// The list shows the top layer first; document index 0 is the bottom.
+int LayersPanel::rowToIndex(int row) const { return document_->layerCount() - 1 - row; }
+int LayersPanel::indexToRow(int index) const { return document_->layerCount() - 1 - index; }
+
+void LayersPanel::refresh() {
+    const QSignalBlocker blockList(list_);
+    list_->clear();
+    if (!document_) {
+        return;
+    }
+    for (int row = 0; row < document_->layerCount(); ++row) {
+        const gas::LayerProps& p = document_->layer(rowToIndex(row)).props;
+        auto* item = new QListWidgetItem(QString::fromStdString(p.name), list_);
+        item->setFlags(Qt::ItemIsSelectable | Qt::ItemIsEnabled | Qt::ItemIsUserCheckable | Qt::ItemIsEditable);
+        item->setCheckState(p.visible ? Qt::Checked : Qt::Unchecked);
+        item->setToolTip(tr("Double-click to rename; checkbox toggles visibility"));
+        QFont font = item->font();
+        font.setItalic(p.locked); // locked layers read differently at a glance
+        item->setFont(font);
+    }
+    const int active = document_->activeLayerIndex();
+    list_->setCurrentRow(indexToRow(active));
+
+    const gas::LayerProps& p = document_->activeLayer().props;
+    {
+        const QSignalBlocker b1(opacity_), b2(lock_);
+        opacity_->setValue(static_cast<int>(std::lround(p.opacity * 100.0)));
+        lock_->setChecked(p.locked);
+    }
+    const int count = document_->layerCount();
+    deleteButton_->setEnabled(count > 1);
+    duplicateButton_->setEnabled(count < gas::Document::kMaxLayers);
+    addButton_->setEnabled(count < gas::Document::kMaxLayers);
+    upButton_->setEnabled(active < count - 1);
+    downButton_->setEnabled(active > 0);
+}
+
+void LayersPanel::onItemChanged(QListWidgetItem* item) {
+    const int index = rowToIndex(list_->row(item));
+    gas::LayerProps p = document_->layer(index).props;
+    p.visible = item->checkState() == Qt::Checked;
+    const std::string name = item->text().trimmed().toStdString();
+    if (!name.empty()) {
+        p.name = name;
+    }
+    document_->setLayerProps(index, p);
+    Q_EMIT documentChanged(); // refresh() also restores an emptied name
+}
+
+void LayersPanel::onCurrentRowChanged(int row) {
+    if (row < 0) {
+        return;
+    }
+    document_->setActiveLayer(rowToIndex(row));
+    Q_EMIT documentChanged();
+}
+
+void LayersPanel::setOpacity(int percent) {
+    gas::LayerProps p = document_->activeLayer().props;
+    p.opacity = percent / 100.0;
+    if (document_->setLayerProps(document_->activeLayerIndex(), p)) {
+        Q_EMIT documentChanged();
+    }
+}
+
+void LayersPanel::setLocked(bool locked) {
+    gas::LayerProps p = document_->activeLayer().props;
+    p.locked = locked;
+    if (document_->setLayerProps(document_->activeLayerIndex(), p)) {
+        Q_EMIT documentChanged();
+    }
+}
+
+void LayersPanel::moveActive(int delta) {
+    const int from = document_->activeLayerIndex();
+    if (document_->moveLayer(from, from + delta)) {
+        Q_EMIT documentChanged();
+    }
+}
