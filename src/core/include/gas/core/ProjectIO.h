@@ -31,6 +31,9 @@ class Document;
 //            f32 x floatCount: opacity, size, offsetX, offsetY, hue,
 //            saturation, lightness, contrast (extra floats are skipped;
 //            effects of unknown type are dropped)
+//     "SLCS" (version 5+) optional: u32 sliceCount, then per slice:
+//            u16 nameLength, UTF-8 name, i32 x, y, w, h, f32 pivotX, pivotY
+//            (readers ignore bytes after the slice list)
 //     "END "
 //   u32 CRC-32 of every preceding byte
 //
@@ -40,9 +43,9 @@ class Document;
 // Only non-empty tiles are stored. Saves are atomic: written to a temporary
 // sibling file, then renamed over the target, so a failed save never damages
 // an existing file. Undo history and the selection are not saved.
-// Version history: 1 = v0.3 (layers), 2 = v0.4 (layer masks), 3 = v0.5 (blend modes), 4 = v0.6 (layer effects). Older versions
+// Version history: 1 = v0.3 (layers), 2 = v0.4 (layer masks), 3 = v0.5 (blend modes), 4 = v0.6 (layer effects), 5 = v0.7 (slices). Older versions
 // still load; newer ones are refused.
-inline constexpr std::uint32_t kProjectFormatVersion = 4;
+inline constexpr std::uint32_t kProjectFormatVersion = 5;
 inline constexpr const char* kProjectExtension = ".gas";
 
 struct IoResult {

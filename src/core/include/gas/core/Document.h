@@ -28,6 +28,16 @@ struct LayerProps {
     friend bool operator==(const LayerProps&, const LayerProps&) = default;
 };
 
+// A named sprite region for slicing/atlas export. The pivot is relative to
+// the rect (0,0 = top-left, 1,1 = bottom-right; may lie outside it).
+struct Slice {
+    std::string name;
+    IRect rect;
+    PointF pivot{0.5, 0.5};
+
+    friend bool operator==(const Slice&, const Slice&) = default;
+};
+
 struct EffectCache;
 
 struct Layer {
@@ -85,6 +95,9 @@ public:
 
     // --- Undoable layer edits (each is one undo step; invalid calls return false) ---
     void addLayer();                  // new empty layer above the active one
+    // New layer above the active one holding `image` (e.g. an imported picture);
+    // false if its size differs from the document's.
+    bool addLayer(const std::string& name, TiledImage image, const std::string& label = "Import Layer");
     bool duplicateLayer(int index);   // copy placed above the original
     bool removeLayer(int index);      // the last remaining layer can't be removed
     bool moveLayer(int from, int to); // to = final index of the moved layer
@@ -146,8 +159,22 @@ public:
     bool flipContent(bool horizontal);
     bool rotateContent90(bool clockwise);
 
+    // --- Slices (sprite regions; saved with the project) ---
+    const std::vector<Slice>& slices() const { return slices_; }
+    // Replaces all slices as one undo step. Rects are clipped to the canvas
+    // (empty ones dropped), pivots clamped to [-4, 5]. With `merge`, consecutive
+    // calls with the same label fold into one step (e.g. dragging a pivot).
+    bool setSlices(std::vector<Slice> slices, const std::string& label = "Edit Slices", bool merge = false);
+    // For loaders: sets the slices without an undo step.
+    void restoreSlices(std::vector<Slice> slices);
+    // Increments whenever the slices change (incl. undo/redo), for views.
+    unsigned slicesGeneration() const { return slicesGeneration_; }
+    // The composite of all visible layers as a sparse tiled image.
+    TiledImage flattenedImage() const;
+
     // --- Canvas ---
-    // Crops every layer (and mask) to `area`; deselects. One undo step.
+    // Crops every layer (and mask) to `area`; deselects; slices move with the
+    // content (clipped, empty ones dropped). One undo step.
     bool crop(IRect area);
 
     // --- History ---
@@ -191,6 +218,8 @@ private:
         // Property edits: which layer, and the shared "after" value merging updates.
         int mergeLayer = -1;
         std::shared_ptr<LayerProps> mergeAfter;
+        // Mergeable slice edits: the shared "after" value.
+        std::shared_ptr<std::vector<Slice>> mergeSlices;
     };
     struct TileChange {
         int tx, ty;
@@ -218,6 +247,7 @@ private:
     void execute(Command cmd);
     void enforceHistoryLimit();
     std::string nextLayerName() const;
+    std::vector<Slice> sanitizedSlices(std::vector<Slice> slices) const;
     // Tiles of `image` that differ in content from `before`.
     static std::vector<TileChange> diffTiles(const std::vector<TiledImage::TilePtr>& before,
                                              const TiledImage& image, std::size_t& bytes);
@@ -236,6 +266,8 @@ private:
     bool editingMask_ = false;
     Selection selection_;
     unsigned selectionGeneration_ = 0;
+    std::vector<Slice> slices_;
+    unsigned slicesGeneration_ = 0;
 
     std::optional<EditSession> edit_;
     std::optional<TransformSession> transform_;

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <gas/core/Brush.h>
+#include <gas/core/Document.h>
 #include <gas/core/Symmetry.h>
 #include <gas/core/Pencil.h>
 #include <gas/core/Selection.h>
@@ -20,7 +21,7 @@ namespace gas {
 class Document;
 }
 
-enum class Tool { Pencil, Brush, Eraser, Fill, Eyedropper, RectSelect, EllipseSelect, Lasso, Move, Smudge, Blur };
+enum class Tool { Pencil, Brush, Eraser, Fill, Eyedropper, RectSelect, EllipseSelect, Lasso, Move, Smudge, Blur, Slice };
 
 // Tools driven by a gas::BrushTool (size/opacity/hardness, tip, dynamics).
 inline bool usesBrushSettings(Tool t) {
@@ -70,6 +71,16 @@ public:
     double streamline() const { return streamline_; }
     void setStreamline(double strength) { streamline_ = std::clamp(strength, 0.0, 1.0); }
 
+    // --- Slices (sprite regions) ---
+    // Slice tool: drag on empty canvas to add a slice, drag a slice to move it,
+    // its handles to resize, its pivot marker to move the pivot (Shift snaps to
+    // edges/centre); arrows nudge, Delete removes (deleteSelectedSlice).
+    int selectedSlice() const { return selectedSlice_; }
+    void setSelectedSlice(int index); // -1 = none
+    bool deleteSelectedSlice();
+    bool showSlices() const { return showSlices_; }
+    void setShowSlices(bool on);
+
     int fillTolerance() const { return fillTolerance_; }
     void setFillTolerance(int tolerance) { fillTolerance_ = tolerance; }
 
@@ -89,7 +100,9 @@ public:
     void setTransformInterpolation(gas::Interpolation i) { interpolation_ = i; }
 
     // True while a stroke, drag or transform is in progress (undo etc. must wait).
-    bool isBusy() const { return editImage_ != nullptr || dragging_ || transform_.has_value(); }
+    bool isBusy() const {
+        return editImage_ != nullptr || dragging_ || transform_.has_value() || sliceDrag_.has_value();
+    }
 
     void zoomIn();
     void zoomOut();
@@ -105,6 +118,7 @@ Q_SIGNALS:
     // A tool could not run (e.g. the layer is locked); `reason` is user-facing.
     void editRefused(const QString& reason);
     void transformModeChanged(bool active);
+    void selectedSliceChanged(int index);
 
 protected:
     void paintGL() override;
@@ -158,6 +172,18 @@ private:
     void drawSelectionPreview(QPainter& p) const;
     void drawTransformBox(QPainter& p) const;
     void zoomAroundCenter(double factor);
+
+    // Slice tool
+    void slicePress(QPointF pos);
+    void sliceDragTo(QPointF pos, Qt::KeyboardModifiers mods);
+    void finishSliceDrag();
+    void nudgeSlice(int dx, int dy);
+    void drawSlices(QPainter& p) const;
+    QRectF sliceScreenRect(const gas::IRect& r) const;
+    QPointF slicePivotScreen(const gas::Slice& s) const;
+    int sliceAt(QPointF pos) const;       // topmost slice under the point (selected first), or -1
+    int sliceHandleAt(QPointF pos) const; // resize handle of the selected slice, or -1
+    bool nearSlicePivot(QPointF pos) const;
     void updateCursorShape();
 
     gas::Affine transformMatrix() const;
@@ -207,6 +233,19 @@ private:
     std::vector<gas::Selection::Segment> outline_;
     QTimer antsTimer_;
     int antsOffset_ = 0;
+
+    // Slices
+    struct SliceDrag {
+        enum class Mode { Create, Move, Resize, Pivot } mode = Mode::Create;
+        int index = -1;  // slice being edited (-1 while creating)
+        int handle = -1; // Resize: 0..7 = TL, T, TR, R, BR, B, BL, L
+        gas::PointF startDoc;
+        gas::Slice start;
+        gas::Slice current; // preview, committed on release
+    };
+    std::optional<SliceDrag> sliceDrag_;
+    int selectedSlice_ = -1;
+    bool showSlices_ = true;
 
     // Transform
     std::optional<TransformState> transform_;

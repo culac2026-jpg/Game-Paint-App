@@ -3,9 +3,11 @@
 #include "BrushPanel.h"
 #include "EffectsPanel.h"
 #include "LayersPanel.h"
+#include "SlicesPanel.h"
 
 #include <gas/core/Document.h>
 #include <gas/core/ProjectIO.h>
+#include <gas/core/Slicing.h>
 
 #include <QActionGroup>
 #include <QCheckBox>
@@ -17,7 +19,14 @@
 #include <QDockWidget>
 #include <QFileDialog>
 #include <QFileInfo>
+#include <QDir>
 #include <QFormLayout>
+#include <QGroupBox>
+#include <QHBoxLayout>
+#include <QImage>
+#include <QImageReader>
+#include <QLineEdit>
+#include <QPushButton>
 #include <QInputDialog>
 #include <QLabel>
 #include <QMenuBar>
@@ -57,6 +66,7 @@ constexpr ToolInfo kTools[] = {
     {Tool::Move, QT_TRANSLATE_NOOP("MainWindow", "Move"), Qt::Key_V},
     {Tool::Smudge, QT_TRANSLATE_NOOP("MainWindow", "Smudge"), Qt::Key_S},
     {Tool::Blur, QT_TRANSLATE_NOOP("MainWindow", "Blur"), Qt::Key_R},
+    {Tool::Slice, QT_TRANSLATE_NOOP("MainWindow", "Slice"), Qt::Key_K},
 };
 
 QColor toQColor(gas::Rgba8 c) { return QColor(c.r, c.g, c.b, c.a); }
@@ -82,6 +92,64 @@ int percent(double fraction) { return static_cast<int>(std::lround(fraction * 10
 std::filesystem::path toFsPath(const QString& path) { return std::filesystem::path(path.toStdWString()); }
 
 const QString kProjectFilter = QObject::tr("GameArt Studio project (*.gas)");
+
+gas::LayerProps layerNamed(const QString& name) {
+    gas::LayerProps props;
+    props.name = name.toStdString();
+    return props;
+}
+
+// Draws `image` into `dst` with its top-left at (ox, oy); pixels outside are clipped.
+void blitImage(gas::TiledImage& dst, const QImage& image, int ox, int oy) {
+    const QImage src = image.convertToFormat(QImage::Format_RGBA8888); // straight alpha, like the document
+    for (int y = 0; y < src.height(); ++y) {
+        const uchar* line = src.constScanLine(y);
+        for (int x = 0; x < src.width(); ++x) {
+            const gas::Rgba8 p{line[4 * x], line[4 * x + 1], line[4 * x + 2], line[4 * x + 3]};
+            if (p.a != 0 && dst.contains({ox + x, oy + y})) {
+                dst.setPixel({ox + x, oy + y}, p);
+            }
+        }
+    }
+}
+
+QString imageFilter() {
+    QStringList patterns;
+    for (const QByteArray& f : QImageReader::supportedImageFormats()) {
+        patterns << QStringLiteral("*.%1").arg(QString::fromLatin1(f));
+    }
+    return QObject::tr("Images (%1);;All files (*)").arg(patterns.join(QLatin1Char(' ')));
+}
+
+// A small modal dialog with a form and OK/Cancel.
+struct FormDialog {
+    explicit FormDialog(QWidget* parent, const QString& title) : dialog(parent), form(new QFormLayout(&dialog)) {
+        dialog.setWindowTitle(title);
+    }
+    bool exec() {
+        auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dialog);
+        QObject::connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
+        QObject::connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+        form->addRow(buttons);
+        return dialog.exec() == QDialog::Accepted;
+    }
+    QSpinBox* spin(const QString& label, int min, int max, int value, const QString& suffix = {}) {
+        auto* box = new QSpinBox(&dialog);
+        box->setRange(min, max);
+        box->setValue(value);
+        box->setSuffix(suffix);
+        form->addRow(label, box);
+        return box;
+    }
+    QCheckBox* check(const QString& text, bool on) {
+        auto* box = new QCheckBox(text, &dialog);
+        box->setChecked(on);
+        form->addRow(QString(), box);
+        return box;
+    }
+    QDialog dialog;
+    QFormLayout* form;
+};
 
 } // namespace
 
@@ -127,6 +195,7 @@ MainWindow::~MainWindow() {
     canvas_->setDocument(nullptr);
     layersPanel_->setDocument(nullptr);
     effectsPanel_->setDocument(nullptr);
+    slicesPanel_->setDocument(nullptr);
 }
 
 void MainWindow::createActions() {
@@ -139,6 +208,14 @@ void MainWindow::createActions() {
     file->addAction(tr("&Export PNG..."), QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_E), this,
                     &MainWindow::exportPng);
     file->addSeparator();
+    file->addAction(tr("&Import Images..."), QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_O), this,
+                    &MainWindow::importImages);
+    documentActions_ << file->addAction(tr("Import as &Layer..."), this, &MainWindow::importAsLayer);
+    documentActions_ << file->addAction(tr("Export &Atlas..."), QKeySequence(Qt::CTRL | Qt::ALT | Qt::Key_E), this,
+                                        &MainWindow::exportAtlas);
+    documentActions_ << file->addAction(tr("Export S&lices as PNGs..."), this, &MainWindow::exportSlices);
+    documentActions_ << file->addAction(tr("Export La&yers as PNGs..."), this, &MainWindow::exportLayers);
+    file->addSeparator();
     file->addAction(tr("E&xit"), QKeySequence::Quit, this, &QWidget::close);
 
     QMenu* edit = menuBar()->addMenu(tr("&Edit"));
@@ -147,8 +224,13 @@ void MainWindow::createActions() {
     redoAction_ = edit->addAction(tr("&Redo"), this, &MainWindow::redo);
     redoAction_->setShortcuts({QKeySequence(Qt::CTRL | Qt::Key_Y), QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_Z)});
     edit->addSeparator();
-    documentActions_ << edit->addAction(tr("C&lear"), QKeySequence::Delete, this,
-                                        [this] { runCommand(document_->eraseSelected()); });
+    documentActions_ << edit->addAction(tr("C&lear"), QKeySequence::Delete, this, [this] {
+        if (canvas_->tool() == Tool::Slice) {
+            canvas_->deleteSelectedSlice(); // Delete removes the selected slice, never pixels
+            return;
+        }
+        runCommand(document_->eraseSelected());
+    });
     documentActions_ << edit->addAction(tr("&Fill with Foreground"), QKeySequence(Qt::ALT | Qt::Key_Backspace),
                                         this,
                                         [this] { runCommand(document_->fillSelected(canvas_->foregroundColor())); });
@@ -177,9 +259,17 @@ void MainWindow::createActions() {
 
     QMenu* image = menuBar()->addMenu(tr("&Image"));
     documentActions_ << image->addAction(tr("&Crop to Selection"), this, &MainWindow::cropToSelection);
+    image->addSeparator();
+    documentActions_ << image->addAction(tr("&Auto Slice..."), this, &MainWindow::autoSlice);
+    documentActions_ << image->addAction(tr("&Grid Slice..."), this, &MainWindow::gridSlice);
 
     QMenu* view = menuBar()->addMenu(tr("&View"));
     view->addAction(tr("Reset &Symmetry Centre"), canvas_, &CanvasWidget::resetSymmetryCenter);
+    QAction* showSlices = view->addAction(tr("Show S&lices"));
+    showSlices->setCheckable(true);
+    showSlices->setChecked(canvas_->showSlices());
+    showSlices->setToolTip(tr("Show slice boxes with every tool (the Slice tool always shows them)"));
+    connect(showSlices, &QAction::toggled, canvas_, &CanvasWidget::setShowSlices);
     view->addSeparator();
     view->addAction(tr("Zoom &In"), QKeySequence::ZoomIn, canvas_, &CanvasWidget::zoomIn);
     view->addAction(tr("Zoom &Out"), QKeySequence::ZoomOut, canvas_, &CanvasWidget::zoomOut);
@@ -333,6 +423,12 @@ void MainWindow::createToolBars() {
 
 void MainWindow::selectTool(Tool tool) {
     canvas_->setTool(tool);
+    if (tool == Tool::Slice && slicesDock_) {
+        slicesDock_->raise();
+        statusBar()->showMessage(tr("Slice: drag to add a sprite region, drag a box to move it, its handles to resize, "
+                                    "the cross to move the pivot (Shift snaps). Arrows nudge, Delete removes."),
+                                 6000);
+    }
     if (QAction* a = toolActions_.value(static_cast<int>(tool))) {
         a->setChecked(true); // keeps the palette in sync when the tool changes programmatically
     }
@@ -457,7 +553,17 @@ void MainWindow::createDocks() {
     effectsDock->setFeatures(QDockWidget::DockWidgetMovable | QDockWidget::DockWidgetFloatable);
     effectsDock->setWidget(effectsPanel_);
     tabifyDockWidget(brushDock, effectsDock);
+    slicesPanel_ = new SlicesPanel(canvas_, this);
+    slicesDock_ = new QDockWidget(tr("Slices"), this);
+    slicesDock_->setObjectName(QStringLiteral("slicesDock"));
+    slicesDock_->setFeatures(QDockWidget::DockWidgetMovable | QDockWidget::DockWidgetFloatable);
+    slicesDock_->setWidget(slicesPanel_);
+    tabifyDockWidget(effectsDock, slicesDock_);
     brushDock->raise();
+    connect(slicesPanel_, &SlicesPanel::documentChanged, this, &MainWindow::onDocumentChanged, Qt::QueuedConnection);
+    connect(slicesPanel_, &SlicesPanel::autoSliceRequested, this, &MainWindow::autoSlice);
+    connect(slicesPanel_, &SlicesPanel::gridSliceRequested, this, &MainWindow::gridSlice);
+    connect(slicesPanel_, &SlicesPanel::exportAtlasRequested, this, &MainWindow::exportAtlas);
     connect(effectsPanel_, &EffectsPanel::documentChanged, this, &MainWindow::onDocumentChanged,
             Qt::QueuedConnection);
     // Once laid out, give the layer list most of the height (sizes set before show() don't stick).
@@ -477,6 +583,7 @@ void MainWindow::setDocument(std::unique_ptr<gas::Document> document, const QStr
     canvas_->setDocument(document.get());
     layersPanel_->setDocument(document.get());
     effectsPanel_->setDocument(document.get());
+    slicesPanel_->setDocument(document.get());
     document_ = std::move(document);
     filePath_ = path;
     onDocumentChanged();
@@ -503,6 +610,8 @@ void MainWindow::onDocumentChanged() {
     layersPanel_->refresh();
     effectsPanel_->setEnabled(!transforming);
     effectsPanel_->refresh();
+    slicesPanel_->setEnabled(!transforming);
+    slicesPanel_->refresh();
     canvas_->update();
 }
 
@@ -711,4 +820,428 @@ void MainWindow::updateStatus() {
     } else {
         cursorLabel_->clear();
     }
+}
+
+// ---------------------------------------------------------------- asset pipeline (v0.7)
+
+QString MainWindow::documentBaseName() const {
+    const QString stem = QFileInfo(filePath_).completeBaseName();
+    return stem.isEmpty() ? QStringLiteral("sprite") : stem;
+}
+
+void MainWindow::importImages() {
+    const QStringList paths = QFileDialog::getOpenFileNames(this, tr("Import Images"), importDir_, imageFilter());
+    if (!paths.isEmpty() && maybeSave()) {
+        importImageFiles(paths);
+    }
+}
+
+void MainWindow::importImageFiles(const QStringList& paths) {
+    if (paths.isEmpty()) {
+        return;
+    }
+    importDir_ = QFileInfo(paths.front()).path();
+    QList<QImage> images;
+    QStringList names, failed;
+    for (const QString& path : paths) {
+        QImage img(path);
+        if (img.isNull() || img.width() > kMaxCanvasSize || img.height() > kMaxCanvasSize) {
+            failed << QFileInfo(path).fileName();
+            continue;
+        }
+        images << img;
+        names << QFileInfo(path).completeBaseName();
+    }
+    if (!failed.isEmpty()) {
+        QMessageBox::warning(this, tr("Import"), tr("Could not import:\n%1").arg(failed.join(QLatin1Char('\n'))));
+    }
+    if (images.isEmpty()) {
+        return;
+    }
+    if (images.size() == 1) {
+        gas::TiledImage img(images[0].width(), images[0].height());
+        blitImage(img, images[0], 0, 0);
+        std::vector<gas::Layer> layers;
+        layers.emplace_back(layerNamed(names[0]), std::move(img));
+        setDocument(std::make_unique<gas::Document>(images[0].width(), images[0].height(), std::move(layers), 0),
+                    QString());
+        canvas_->zoomToFit();
+        statusBar()->showMessage(tr("Imported %1 (%2\u00D7%3)").arg(names[0]).arg(images[0].width()).arg(images[0].height()),
+                                 4000);
+        return;
+    }
+    // Several images: a grid of equal cells (the largest image's size), each
+    // image centred horizontally and standing on its cell's bottom edge, with
+    // one slice per cell so the pivots line up for animation.
+    int cellW = 1, cellH = 1;
+    bool sameSize = true;
+    for (const QImage& img : images) {
+        cellW = std::max(cellW, img.width());
+        cellH = std::max(cellH, img.height());
+        sameSize = sameSize && img.size() == images[0].size();
+    }
+    const int n = static_cast<int>(images.size());
+    int cols = static_cast<int>(std::ceil(std::sqrt(static_cast<double>(n))));
+    cols = std::min(cols, std::max(1, kMaxCanvasSize / cellW));
+    const int rows = (n + cols - 1) / cols;
+    if (static_cast<long long>(rows) * cellH > kMaxCanvasSize) {
+        QMessageBox::warning(this, tr("Import"), tr("Too many images for one canvas (max %1 px).").arg(kMaxCanvasSize));
+        return;
+    }
+    gas::TiledImage sheet(cols * cellW, rows * cellH);
+    std::vector<gas::Slice> slices;
+    std::vector<std::string> taken;
+    const gas::PointF pivot = sameSize ? gas::PointF{0.5, 0.5} : gas::PointF{0.5, 1.0};
+    for (int i = 0; i < n; ++i) {
+        const int cx = (i % cols) * cellW, cy = (i / cols) * cellH;
+        blitImage(sheet, images[i], cx + (cellW - images[i].width()) / 2, cy + cellH - images[i].height());
+        const std::string name = gas::uniqueName(names[i].toStdString(), taken);
+        taken.push_back(name);
+        slices.push_back({name, {cx, cy, cellW, cellH}, pivot});
+    }
+    std::vector<gas::Layer> layers;
+    layers.emplace_back(layerNamed(tr("Sprites")), std::move(sheet));
+    auto doc = std::make_unique<gas::Document>(cols * cellW, rows * cellH, std::move(layers), 0);
+    doc->restoreSlices(std::move(slices));
+    setDocument(std::move(doc), QString());
+    canvas_->zoomToFit();
+    statusBar()->showMessage(tr("Imported %1 images as a %2\u00D7%3 sheet with one slice each").arg(n).arg(cols).arg(rows),
+                             5000);
+}
+
+void MainWindow::importAsLayer() {
+    settleCanvas();
+    const QString path = QFileDialog::getOpenFileName(this, tr("Import as Layer"), importDir_, imageFilter());
+    if (path.isEmpty()) {
+        return;
+    }
+    importDir_ = QFileInfo(path).path();
+    const QImage image(path);
+    if (image.isNull()) {
+        QMessageBox::warning(this, tr("Import"), tr("Could not read \"%1\".").arg(QFileInfo(path).fileName()));
+        return;
+    }
+    gas::TiledImage img(document_->width(), document_->height());
+    blitImage(img, image, 0, 0);
+    if (document_->addLayer(QFileInfo(path).completeBaseName().toStdString(), std::move(img))) {
+        onDocumentChanged();
+        if (image.width() > document_->width() || image.height() > document_->height()) {
+            statusBar()->showMessage(tr("The image is larger than the canvas and was clipped"), 4000);
+        }
+    }
+}
+
+void MainWindow::autoSlice() {
+    settleCanvas();
+    if (canvas_->isBusy()) {
+        return;
+    }
+    static gas::AutoSliceOptions last;
+    static int lastPivot = 0;
+    FormDialog d(this, tr("Auto Slice"));
+    auto* name = new QLineEdit(documentBaseName(), &d.dialog);
+    d.form->addRow(tr("Name prefix:"), name);
+    QSpinBox* merge = d.spin(tr("Merge parts closer than:"), 0, 256, last.mergeDistance, tr(" px"));
+    merge->setToolTip(tr("Detached parts within this distance become one sprite"));
+    QSpinBox* minPixels = d.spin(tr("Ignore islands under:"), 1, 100000, last.minPixels, tr(" px"));
+    QSpinBox* alpha = d.spin(tr("Alpha threshold:"), 0, 254, last.alphaThreshold);
+    alpha->setToolTip(tr("Pixels with alpha at or below this count as empty"));
+    auto* pivot = new QComboBox(&d.dialog);
+    fillPivotCombo(pivot);
+    pivot->removeItem(pivot->count() - 1); // no "Custom" here
+    pivot->setCurrentIndex(lastPivot);
+    d.form->addRow(tr("Pivot:"), pivot);
+    QCheckBox* replace = d.check(tr("Replace existing slices"), true);
+    if (!d.exec()) {
+        return;
+    }
+    last.mergeDistance = merge->value();
+    last.minPixels = minPixels->value();
+    last.alphaThreshold = alpha->value();
+    lastPivot = pivot->currentIndex();
+    const std::vector<gas::IRect> rects = gas::autoSlices(document_->flattenedImage(), last);
+    if (rects.empty()) {
+        statusBar()->showMessage(tr("No sprites found (the visible layers are empty)"), 4000);
+        return;
+    }
+    std::vector<gas::Slice> slices = replace->isChecked() ? std::vector<gas::Slice>{} : document_->slices();
+    std::vector<std::string> taken;
+    for (const gas::Slice& s : slices) {
+        taken.push_back(s.name);
+    }
+    const std::string base = name->text().trimmed().isEmpty() ? "sprite" : name->text().trimmed().toStdString();
+    for (gas::Slice s : gas::namedSlices(rects, base, pivotFromCombo(pivot, {0.5, 0.5}), static_cast<int>(slices.size()))) {
+        s.name = gas::uniqueName(s.name, taken);
+        taken.push_back(s.name);
+        slices.push_back(std::move(s));
+    }
+    if (document_->setSlices(std::move(slices), "Auto Slice")) {
+        onDocumentChanged();
+        slicesDock_->raise();
+    }
+    statusBar()->showMessage(tr("Found %1 sprites").arg(rects.size()), 4000);
+}
+
+void MainWindow::gridSlice() {
+    settleCanvas();
+    if (canvas_->isBusy()) {
+        return;
+    }
+    static gas::GridSliceOptions last;
+    static int lastPivot = 0;
+    FormDialog d(this, tr("Grid Slice"));
+    auto* name = new QLineEdit(documentBaseName(), &d.dialog);
+    d.form->addRow(tr("Name prefix:"), name);
+    QSpinBox* cw = d.spin(tr("Cell width:"), 1, document_->width(), std::min(last.cellWidth, document_->width()), tr(" px"));
+    QSpinBox* ch = d.spin(tr("Cell height:"), 1, document_->height(), std::min(last.cellHeight, document_->height()), tr(" px"));
+    QSpinBox* ox = d.spin(tr("Offset X:"), 0, document_->width() - 1, last.offsetX, tr(" px"));
+    QSpinBox* oy = d.spin(tr("Offset Y:"), 0, document_->height() - 1, last.offsetY, tr(" px"));
+    QSpinBox* sx = d.spin(tr("Spacing X:"), 0, 4096, last.spacingX, tr(" px"));
+    QSpinBox* sy = d.spin(tr("Spacing Y:"), 0, 4096, last.spacingY, tr(" px"));
+    auto* info = new QLabel(&d.dialog);
+    d.form->addRow(QString(), info);
+    const auto updateInfo = [&] {
+        const int stepX = cw->value() + sx->value(), stepY = ch->value() + sy->value();
+        const int cols = std::max(0, (document_->width() - ox->value() + sx->value()) / stepX);
+        const int rows = std::max(0, (document_->height() - oy->value() + sy->value()) / stepY);
+        info->setText(tr("%1 columns \u00D7 %2 rows").arg(cols).arg(rows));
+    };
+    for (QSpinBox* box : {cw, ch, ox, oy, sx, sy}) {
+        QObject::connect(box, &QSpinBox::valueChanged, &d.dialog, updateInfo);
+    }
+    updateInfo();
+    QCheckBox* skip = d.check(tr("Skip empty cells"), last.skipEmpty);
+    auto* pivot = new QComboBox(&d.dialog);
+    fillPivotCombo(pivot);
+    pivot->removeItem(pivot->count() - 1);
+    pivot->setCurrentIndex(lastPivot);
+    d.form->addRow(tr("Pivot:"), pivot);
+    QCheckBox* replace = d.check(tr("Replace existing slices"), true);
+    if (!d.exec()) {
+        return;
+    }
+    last.cellWidth = cw->value();
+    last.cellHeight = ch->value();
+    last.offsetX = ox->value();
+    last.offsetY = oy->value();
+    last.spacingX = sx->value();
+    last.spacingY = sy->value();
+    last.skipEmpty = skip->isChecked();
+    lastPivot = pivot->currentIndex();
+    const std::vector<gas::IRect> rects = gas::gridSlices(document_->flattenedImage(), last);
+    if (rects.empty()) {
+        statusBar()->showMessage(tr("No cells (all empty, or the cell is larger than the canvas)"), 4000);
+        return;
+    }
+    std::vector<gas::Slice> slices = replace->isChecked() ? std::vector<gas::Slice>{} : document_->slices();
+    std::vector<std::string> taken;
+    for (const gas::Slice& s : slices) {
+        taken.push_back(s.name);
+    }
+    const std::string base = name->text().trimmed().isEmpty() ? "sprite" : name->text().trimmed().toStdString();
+    for (gas::Slice s : gas::namedSlices(rects, base, pivotFromCombo(pivot, {0.5, 0.5}), static_cast<int>(slices.size()))) {
+        s.name = gas::uniqueName(s.name, taken);
+        taken.push_back(s.name);
+        slices.push_back(std::move(s));
+    }
+    if (document_->setSlices(std::move(slices), "Grid Slice")) {
+        onDocumentChanged();
+        slicesDock_->raise();
+    }
+    statusBar()->showMessage(tr("%1 slices").arg(rects.size()), 4000);
+}
+
+void MainWindow::exportAtlas() {
+    settleCanvas();
+    if (document_->slices().empty()) {
+        QMessageBox::information(this, tr("Export Atlas"),
+                                 tr("There are no slices yet. Use the Slice tool (K), Image > Auto Slice or "
+                                    "Image > Grid Slice to mark the sprites first."));
+        return;
+    }
+    FormDialog d(this, tr("Export Atlas"));
+    auto* preset = new QComboBox(&d.dialog);
+    for (int i = 0; i < gas::kAtlasPresetCount; ++i) {
+        preset->addItem(tr(gas::atlasPresetName(static_cast<gas::AtlasPreset>(i)).data()));
+    }
+    d.form->addRow(tr("Preset:"), preset);
+    auto* format = new QComboBox(&d.dialog);
+    for (int i = 0; i < gas::kAtlasFormatCount; ++i) {
+        format->addItem(tr(gas::atlasFormatName(static_cast<gas::AtlasFormat>(i)).data()));
+    }
+    d.form->addRow(tr("Metadata:"), format);
+    auto* maxSize = new QComboBox(&d.dialog);
+    for (int s = 256; s <= kMaxCanvasSize; s *= 2) {
+        maxSize->addItem(QStringLiteral("%1 \u00D7 %1").arg(s), s);
+    }
+    d.form->addRow(tr("Max page size:"), maxSize);
+    QSpinBox* padding = d.spin(tr("Padding:"), 0, 64, 0, tr(" px"));
+    padding->setToolTip(tr("Transparent pixels between sprites"));
+    QSpinBox* border = d.spin(tr("Border:"), 0, 64, 0, tr(" px"));
+    border->setToolTip(tr("Transparent pixels along the page edges"));
+    QSpinBox* extrude = d.spin(tr("Extrude:"), 0, 16, 0, tr(" px"));
+    extrude->setToolTip(tr("Repeat each sprite's edge pixels outward, so filtering and mipmaps never bleed in a neighbour"));
+    QCheckBox* trim = d.check(tr("Trim transparent edges (offsets kept in the metadata)"), true);
+    QCheckBox* pot = d.check(tr("Power-of-two page sizes"), true);
+    QCheckBox* point = d.check(tr("Unity: point filter, no compression (pixel art)"), false);
+    QSpinBox* ppu = d.spin(tr("Unity pixels per unit:"), 1, 10000, 100);
+
+    auto* path = new QLineEdit(&d.dialog);
+    auto* browse = new QPushButton(tr("Browse..."), &d.dialog);
+    auto* pathRow = new QHBoxLayout;
+    pathRow->addWidget(path, 1);
+    pathRow->addWidget(browse);
+    d.form->addRow(tr("File:"), pathRow);
+    if (atlasPath_.isEmpty()) {
+        const QString dir = filePath_.isEmpty() ? QDir::homePath() : QFileInfo(filePath_).path();
+        atlasPath_ = QDir(dir).filePath(documentBaseName() + QStringLiteral(".png"));
+    }
+    path->setText(QDir::toNativeSeparators(atlasPath_));
+    QObject::connect(browse, &QPushButton::clicked, &d.dialog, [&] {
+        const QString chosen = QFileDialog::getSaveFileName(&d.dialog, tr("Atlas Image"), path->text(), tr("PNG image (*.png)"));
+        if (!chosen.isEmpty()) {
+            path->setText(QDir::toNativeSeparators(chosen));
+        }
+    });
+    auto* note = new QLabel(&d.dialog);
+    note->setWordWrap(true);
+    d.form->addRow(note);
+
+    const auto load = [&](const gas::AtlasSettings& s) {
+        format->setCurrentIndex(static_cast<int>(s.format));
+        maxSize->setCurrentIndex(std::max(0, maxSize->findData(s.maxWidth)));
+        padding->setValue(s.padding);
+        border->setValue(s.border);
+        extrude->setValue(s.extrude);
+        trim->setChecked(s.trim);
+        pot->setChecked(s.powerOfTwo);
+        point->setChecked(s.pointFilter);
+        ppu->setValue(s.pixelsPerUnit);
+    };
+    const auto syncNote = [&] {
+        const auto f = static_cast<gas::AtlasFormat>(format->currentIndex());
+        point->setEnabled(f == gas::AtlasFormat::UnityMeta);
+        ppu->setEnabled(f == gas::AtlasFormat::UnityMeta);
+        switch (f) {
+        case gas::AtlasFormat::UnityMeta:
+            note->setText(tr("Writes name.png + name.png.meta. Copy both into Assets/ (replace any existing meta) and "
+                             "Unity imports a Multiple sprite sheet with these names and pivots."));
+            break;
+        case gas::AtlasFormat::CocosPlist:
+            note->setText(tr("Writes name.png + name.plist. Drop both into the Cocos Creator assets panel to get a "
+                             "Sprite Atlas. Pivots are not part of this format (set the node anchor)."));
+            break;
+        case gas::AtlasFormat::JsonHash:
+            note->setText(tr("Writes name.png + name.json (JSON hash, with pivots), readable by Phaser, PixiJS and "
+                             "most engines' atlas importers."));
+            break;
+        }
+    };
+    preset->setCurrentIndex(atlasPreset_);
+    load(atlasSettings_);
+    syncNote();
+    QObject::connect(preset, &QComboBox::activated, &d.dialog, [&](int i) {
+        load(gas::atlasPreset(static_cast<gas::AtlasPreset>(i)));
+        syncNote();
+    });
+    QObject::connect(format, &QComboBox::currentIndexChanged, &d.dialog, syncNote);
+    if (!d.exec()) {
+        return;
+    }
+    gas::AtlasSettings s;
+    s.format = static_cast<gas::AtlasFormat>(format->currentIndex());
+    s.maxWidth = s.maxHeight = maxSize->currentData().toInt();
+    s.padding = padding->value();
+    s.border = border->value();
+    s.extrude = extrude->value();
+    s.trim = trim->isChecked();
+    s.powerOfTwo = pot->isChecked();
+    s.pointFilter = point->isChecked();
+    s.pixelsPerUnit = ppu->value();
+    atlasSettings_ = s;
+    atlasPreset_ = preset->currentIndex();
+    QString file = QDir::fromNativeSeparators(path->text().trimmed());
+    if (file.isEmpty()) {
+        return;
+    }
+    if (!file.endsWith(QStringLiteral(".png"), Qt::CaseInsensitive)) {
+        file += QStringLiteral(".png");
+    }
+    atlasPath_ = file;
+
+    const gas::Atlas atlas = gas::packAtlas(gas::spritesFromSlices(*document_), s);
+    std::vector<std::filesystem::path> written;
+    const gas::IoResult result = gas::exportAtlas(atlas, s, toFsPath(file), &written);
+    if (!result.ok) {
+        QMessageBox::warning(this, tr("Export Failed"), tr("Could not export the atlas:\n%1").arg(QString::fromStdString(result.error)));
+        return;
+    }
+    QStringList sizes;
+    for (const gas::AtlasPage& p : atlas.pages) {
+        sizes << QStringLiteral("%1\u00D7%2").arg(p.width).arg(p.height);
+    }
+    statusBar()->showMessage(tr("Exported %1 sprites on %2 page(s) (%3) to %4")
+                                 .arg(atlas.frames.size())
+                                 .arg(atlas.pages.size())
+                                 .arg(sizes.join(QStringLiteral(", ")), QFileInfo(file).fileName()),
+                             6000);
+}
+
+void MainWindow::exportSlices() {
+    settleCanvas();
+    if (document_->slices().empty()) {
+        statusBar()->showMessage(tr("There are no slices to export"), 4000);
+        return;
+    }
+    static bool lastTrim = false;
+    static int lastScale = 1;
+    FormDialog d(this, tr("Export Slices as PNGs"));
+    auto* folder = new QLineEdit(&d.dialog);
+    auto* browse = new QPushButton(tr("Browse..."), &d.dialog);
+    auto* row = new QHBoxLayout;
+    row->addWidget(folder, 1);
+    row->addWidget(browse);
+    d.form->addRow(tr("Folder:"), row);
+    if (exportDir_.isEmpty()) {
+        exportDir_ = QDir(filePath_.isEmpty() ? QDir::homePath() : QFileInfo(filePath_).path()).filePath(documentBaseName());
+    }
+    folder->setText(QDir::toNativeSeparators(exportDir_));
+    QObject::connect(browse, &QPushButton::clicked, &d.dialog, [&] {
+        const QString chosen = QFileDialog::getExistingDirectory(&d.dialog, tr("Export Folder"), folder->text());
+        if (!chosen.isEmpty()) {
+            folder->setText(QDir::toNativeSeparators(chosen));
+        }
+    });
+    QCheckBox* trim = d.check(tr("Trim transparent edges"), lastTrim);
+    QSpinBox* scale = d.spin(tr("Scale (nearest neighbour):"), 1, 16, lastScale, tr("\u00D7"));
+    if (!d.exec() || folder->text().trimmed().isEmpty()) {
+        return;
+    }
+    lastTrim = trim->isChecked();
+    lastScale = scale->value();
+    exportDir_ = QDir::fromNativeSeparators(folder->text().trimmed());
+    std::vector<std::filesystem::path> written;
+    const gas::IoResult r = gas::exportSlicePngs(*document_, toFsPath(exportDir_), lastTrim, lastScale, &written);
+    if (!r.ok) {
+        QMessageBox::warning(this, tr("Export Failed"), QString::fromStdString(r.error));
+        return;
+    }
+    statusBar()->showMessage(tr("Exported %1 PNGs to %2").arg(written.size()).arg(QDir::toNativeSeparators(exportDir_)), 6000);
+}
+
+void MainWindow::exportLayers() {
+    settleCanvas();
+    const QString start = exportDir_.isEmpty() ? (filePath_.isEmpty() ? QDir::homePath() : QFileInfo(filePath_).path()) : exportDir_;
+    const QString dir = QFileDialog::getExistingDirectory(this, tr("Export Layers to Folder"), start);
+    if (dir.isEmpty()) {
+        return;
+    }
+    exportDir_ = dir;
+    std::vector<std::filesystem::path> written;
+    const gas::IoResult r = gas::exportLayerPngs(*document_, toFsPath(dir), &written);
+    if (!r.ok) {
+        QMessageBox::warning(this, tr("Export Failed"), QString::fromStdString(r.error));
+        return;
+    }
+    statusBar()->showMessage(tr("Exported %1 layers to %2").arg(written.size()).arg(QDir::toNativeSeparators(dir)), 6000);
 }

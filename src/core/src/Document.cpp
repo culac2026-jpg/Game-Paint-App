@@ -3,6 +3,7 @@
 #include "gas/core/Blend.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <stdexcept>
 
@@ -161,6 +162,11 @@ void Document::execute(Command cmd) {
         *undo_.back().mergeAfter = *cmd.mergeAfter;
         return;
     }
+    if (cmd.mergeSlices && !undo_.empty() && undo_.back().mergeSlices && undo_.back().label == cmd.label &&
+        !atCleanState && !hadRedo) {
+        *undo_.back().mergeSlices = *cmd.mergeSlices;
+        return;
+    }
     if (cleanIndex_ > static_cast<long long>(undo_.size())) {
         cleanIndex_ = -1; // the saved state was in the discarded redo branch
     }
@@ -242,6 +248,29 @@ void Document::addLayer() {
                  activeLayer_ = index;
                  structureDirty_ = true;
              }});
+}
+
+bool Document::addLayer(const std::string& name, TiledImage image, const std::string& label) {
+    if (busy() || image.width() != width_ || image.height() != height_ || layerCount() >= kMaxLayers) {
+        return false;
+    }
+    image.takeDirtyTiles();
+    const int index = activeLayer_ + 1;
+    const int prevActive = activeLayer_;
+    Layer layer(namedProps(name.empty() ? nextLayerName() : name), std::move(image));
+    ++createdLayers_;
+    execute({label,
+             [this, index, prevActive] {
+                 layers_.erase(layers_.begin() + index);
+                 activeLayer_ = prevActive;
+                 structureDirty_ = true;
+             },
+             [this, index, layer] {
+                 layers_.insert(layers_.begin() + index, layer);
+                 activeLayer_ = index;
+                 structureDirty_ = true;
+             }});
+    return true;
 }
 
 bool Document::duplicateLayer(int index) {
@@ -768,6 +797,65 @@ bool Document::rotateContent90(bool clockwise) {
 
 // ---------------------------------------------------------------- canvas
 
+// ---------------------------------------------------------------- slices
+
+std::vector<Slice> Document::sanitizedSlices(std::vector<Slice> slices) const {
+    std::vector<Slice> out;
+    out.reserve(slices.size());
+    const auto clampPivot = [](double v) { return std::isfinite(v) ? std::clamp(v, -4.0, 5.0) : 0.5; };
+    for (Slice& s : slices) {
+        s.rect = s.rect.intersected({0, 0, width_, height_});
+        if (s.rect.empty()) {
+            continue;
+        }
+        s.pivot = {clampPivot(s.pivot.x), clampPivot(s.pivot.y)};
+        out.push_back(std::move(s));
+    }
+    return out;
+}
+
+bool Document::setSlices(std::vector<Slice> slices, const std::string& label, bool merge) {
+    slices = sanitizedSlices(std::move(slices));
+    if (busy() || slices == slices_) {
+        return false;
+    }
+    std::vector<Slice> before = slices_;
+    auto after = std::make_shared<std::vector<Slice>>(std::move(slices));
+    Command cmd{label,
+                [this, before = std::move(before)] {
+                    slices_ = before;
+                    ++slicesGeneration_;
+                },
+                [this, after] {
+                    slices_ = *after;
+                    ++slicesGeneration_;
+                }};
+    if (merge) {
+        cmd.mergeSlices = after;
+    }
+    execute(std::move(cmd));
+    return true;
+}
+
+void Document::restoreSlices(std::vector<Slice> slices) {
+    slices_ = sanitizedSlices(std::move(slices));
+    ++slicesGeneration_;
+}
+
+TiledImage Document::flattenedImage() const {
+    TiledImage out(width_, height_);
+    for (int ty = 0; ty < tilesY(); ++ty) {
+        for (int tx = 0; tx < tilesX(); ++tx) {
+            auto tile = std::make_shared<TiledImage::Tile>();
+            if (compositeTile(tx, ty, *tile)) {
+                out.setTile(tx, ty, std::move(tile));
+            }
+        }
+    }
+    out.takeDirtyTiles();
+    return out;
+}
+
 bool Document::crop(IRect area) {
     area = area.intersected({0, 0, width_, height_});
     if (busy() || area.empty() || area == IRect{0, 0, width_, height_}) {
@@ -782,19 +870,32 @@ bool Document::crop(IRect area) {
         }
         cropped.push_back(std::move(c));
     }
+    std::vector<Slice> movedSlices;
+    for (Slice s : slices_) {
+        s.rect = s.rect.intersected(area);
+        if (!s.rect.empty()) {
+            s.rect.x -= area.x;
+            s.rect.y -= area.y;
+            movedSlices.push_back(std::move(s));
+        }
+    }
     struct State {
         int width, height;
         std::vector<Layer> layers;
         Selection selection;
+        std::vector<Slice> slices;
     };
-    auto before = std::make_shared<const State>(State{width_, height_, layers_, selection_});
-    auto after = std::make_shared<const State>(State{area.w, area.h, std::move(cropped), Selection(area.w, area.h)});
+    auto before = std::make_shared<const State>(State{width_, height_, layers_, selection_, slices_});
+    auto after = std::make_shared<const State>(
+        State{area.w, area.h, std::move(cropped), Selection(area.w, area.h), std::move(movedSlices)});
     const auto apply = [this](const State& s) {
         width_ = s.width;
         height_ = s.height;
         layers_ = s.layers;
         selection_ = s.selection;
+        slices_ = s.slices;
         ++selectionGeneration_;
+        ++slicesGeneration_;
         structureDirty_ = true;
     };
     execute({"Crop", [apply, before] { apply(*before); }, [apply, after] { apply(*after); }});

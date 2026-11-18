@@ -2,6 +2,8 @@
 
 #include "CanvasWidget.h"
 
+#include <gas/core/Atlas.h>
+
 #include <QHash>
 #include <QMainWindow>
 
@@ -14,9 +16,11 @@ class Document;
 class BrushPanel;
 class EffectsPanel;
 class LayersPanel;
+class SlicesPanel;
 class QAction;
 class QCheckBox;
 class QComboBox;
+class QDockWidget;
 class QLabel;
 class QSpinBox;
 class QToolButton;
@@ -30,6 +34,8 @@ public:
 
     // Opens a project file; returns false (after telling the user) on failure.
     bool openFile(const QString& path);
+    // Imports image files: one -> a new document; several -> a sheet with one slice each.
+    void importImageFiles(const QStringList& paths);
 
 protected:
     void closeEvent(QCloseEvent* event) override;
@@ -48,6 +54,15 @@ private:
     bool saveAs();
     bool saveTo(const QString& path);
     void exportPng();
+    // v0.7 asset pipeline
+    void importImages();  // one image -> new document; several -> a sheet with one slice each
+    void importAsLayer(); // an image as a new layer of the current document
+    void autoSlice();
+    void gridSlice();
+    void exportAtlas();
+    void exportSlices();
+    void exportLayers();
+    QString documentBaseName() const; // file stem, or "sprite"
     // Asks to save unsaved changes; false if the user cancelled.
     bool maybeSave();
     void setDocument(std::unique_ptr<gas::Document> document, const QString& path);
@@ -74,6 +89,13 @@ private:
     LayersPanel* layersPanel_ = nullptr;
     BrushPanel* brushPanel_ = nullptr;
     EffectsPanel* effectsPanel_ = nullptr;
+    SlicesPanel* slicesPanel_ = nullptr;
+    QDockWidget* slicesDock_ = nullptr;
+    gas::AtlasSettings atlasSettings_ = gas::atlasPreset(gas::AtlasPreset::Unity);
+    int atlasPreset_ = 0;
+    QString atlasPath_;   // last atlas PNG
+    QString exportDir_;   // last batch-export folder
+    QString importDir_;   // last import folder
     QLabel* zoomLabel_ = nullptr;
     QLabel* opacityLabel_ = nullptr;
     QLabel* cursorLabel_ = nullptr;

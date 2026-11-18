@@ -32,6 +32,7 @@ constexpr std::uint32_t kChunkLayer = fourcc("LAYR");
 constexpr std::uint32_t kChunkMask = fourcc("LMSK");
 constexpr std::uint32_t kChunkLayerProps = fourcc("LPRP");
 constexpr std::uint32_t kChunkEffects = fourcc("LEFX");
+constexpr std::uint32_t kChunkSlices = fourcc("SLCS");
 constexpr std::uint32_t kChunkEnd = fourcc("END ");
 
 std::uint32_t crc32Of(const std::uint8_t* data, std::size_t size) {
@@ -281,6 +282,21 @@ IoResult saveProject(const Document& doc, const fs::path& path) {
             w.chunk(kChunkEffects, ew);
         }
     }
+    if (!doc.slices().empty()) {
+        ByteWriter sw;
+        sw.u32(static_cast<std::uint32_t>(doc.slices().size()));
+        for (const Slice& s : doc.slices()) {
+            const std::size_t n = std::min<std::size_t>(s.name.size(), 0xFFFF);
+            sw.u16(static_cast<std::uint16_t>(n));
+            sw.raw(s.name.data(), n);
+            for (int v : {s.rect.x, s.rect.y, s.rect.w, s.rect.h}) {
+                sw.u32(static_cast<std::uint32_t>(v));
+            }
+            sw.f32(static_cast<float>(s.pivot.x));
+            sw.f32(static_cast<float>(s.pivot.y));
+        }
+        w.chunk(kChunkSlices, sw);
+    }
     w.chunk(kChunkEnd, ByteWriter{});
     w.u32(crc32Of(w.bytes.data(), w.bytes.size()));
     return writeFileAtomic(path, w.bytes);
@@ -321,6 +337,7 @@ LoadResult loadProject(const fs::path& path) {
     std::uint32_t expectedLayers = 0;
     bool haveHeader = false, haveEnd = false;
     std::vector<Layer> layers;
+    std::vector<Slice> slices;
 
     while (r.remaining() > 0 && !haveEnd) {
         const std::uint32_t tag = r.u32();
@@ -423,6 +440,27 @@ LoadResult loadProject(const fs::path& path) {
                 effects.push_back(sanitized(e));
             }
             layers[index].props.effects = std::move(effects);
+        } else if (tag == kChunkSlices) {
+            const std::uint32_t count = c.u32();
+            if (!c.ok() || count > c.remaining()) {
+                return fail("Invalid slices");
+            }
+            for (std::uint32_t k = 0; k < count; ++k) {
+                Slice s;
+                const std::uint16_t nameLength = c.u16();
+                const std::uint8_t* name = c.bytes(nameLength);
+                s.rect.x = static_cast<std::int32_t>(c.u32());
+                s.rect.y = static_cast<std::int32_t>(c.u32());
+                s.rect.w = static_cast<std::int32_t>(c.u32());
+                s.rect.h = static_cast<std::int32_t>(c.u32());
+                s.pivot.x = c.f32();
+                s.pivot.y = c.f32();
+                if (!c.ok()) {
+                    return fail("Invalid slices");
+                }
+                s.name.assign(reinterpret_cast<const char*>(name), nameLength);
+                slices.push_back(std::move(s));
+            }
         } else if (tag == kChunkEnd) {
             haveEnd = true;
         }
@@ -435,7 +473,9 @@ LoadResult loadProject(const fs::path& path) {
     if (layers.size() != expectedLayers) {
         return fail("Layer count does not match the header");
     }
-    return {std::make_unique<Document>(width, height, std::move(layers), active), {}};
+    auto document = std::make_unique<Document>(width, height, std::move(layers), active);
+    document->restoreSlices(std::move(slices)); // clipped/sanitised like any edit
+    return {std::move(document), {}};
 }
 
 // ------------------------------------------------------------ PNG
