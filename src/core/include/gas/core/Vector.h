@@ -73,6 +73,12 @@ VectorPath polygonPath(PointF centre, double radius, int sides, double innerRati
 std::vector<PointF> flattenPath(const VectorPath& path, double tolerance = 0.2);
 // Bounds of the anchors and handles (contain the curve).
 RectF pathControlBounds(const VectorPath& path);
+// Limits that keep rendering time bounded for any input (files, plugins).
+inline constexpr double kMaxVectorCoordinate = 131072.0; // px, 8x the largest canvas
+inline constexpr double kMaxStrokeWidth = 4096.0;
+// Coordinates made finite and clamped to +-kMaxVectorCoordinate, widths to
+// [0, kMaxStrokeWidth]. The document stores only sanitized shapes.
+VectorShapes sanitizedShapes(VectorShapes shapes);
 // Pixels the shape may touch: fill plus stroke (with miters and caps) plus anti-aliasing.
 IRect shapeBounds(const VectorShape& shape);
 // Every point mapped by `m`; the stroke width scales by sqrt(|det m|).

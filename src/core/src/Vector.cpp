@@ -72,7 +72,7 @@ void flattenCubic(std::vector<PointF>& out, PointF p0, PointF c1, PointF c2, Poi
         d1 = std::abs(cross(c1 - p0, chord)) / len;
         d2 = std::abs(cross(c2 - p0, chord)) / len;
     }
-    if (depth >= 16 || std::max(d1, d2) <= tol) {
+    if (depth >= 12 || std::max(d1, d2) <= tol) { // at most 4096 points per curve
         out.push_back(p3);
         return;
     }
@@ -446,6 +446,22 @@ std::vector<PointF> flattenPath(const VectorPath& path, double tolerance) {
         out.pop_back(); // the closing segment ends where the path began
     }
     return out;
+}
+
+VectorShapes sanitizedShapes(VectorShapes shapes) {
+    const auto fix = [](double v) {
+        return std::isfinite(v) ? std::clamp(v, -kMaxVectorCoordinate, kMaxVectorCoordinate) : 0.0;
+    };
+    for (VectorShape& s : shapes) {
+        for (PathNode& n : s.path.nodes) {
+            for (double* v : {&n.p.x, &n.p.y, &n.in.x, &n.in.y, &n.out.x, &n.out.y}) {
+                *v = fix(*v);
+            }
+        }
+        s.style.strokeWidth =
+            std::isfinite(s.style.strokeWidth) ? std::clamp(s.style.strokeWidth, 0.0, kMaxStrokeWidth) : 1.0;
+    }
+    return shapes;
 }
 
 RectF pathControlBounds(const VectorPath& path) {

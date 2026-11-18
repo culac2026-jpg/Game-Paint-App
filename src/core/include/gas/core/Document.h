@@ -280,6 +280,8 @@ public:
     // Modified = the current state differs from the last markSaved() (or creation).
     bool isModified() const;
     void markSaved();
+    // Marks the document as differing from any file (e.g. recovered from an autosave).
+    void markUnsaved() { cleanIndex_ = -1; }
 
     // --- Rendering ---
     // Composites visible layers into `out`; false (out untouched) if the tile is empty.

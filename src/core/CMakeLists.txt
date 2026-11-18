@@ -16,10 +16,13 @@ add_library(gas_core STATIC
     src/ProjectIO.cpp
     src/Selection.cpp
     src/Transform.cpp
+    src/Recovery.cpp
+    src/Plugins.cpp
+    src/SampleProjects.cpp
 )
 add_library(gas::core ALIAS gas_core)
 
 find_package(ZLIB REQUIRED)
 
 target_include_directories(gas_core PUBLIC include)
-target_link_libraries(gas_core PRIVATE gas_warnings ZLIB::ZLIB)
+target_link_libraries(gas_core PRIVATE gas_warnings ZLIB::ZLIB ${CMAKE_DL_LIBS})

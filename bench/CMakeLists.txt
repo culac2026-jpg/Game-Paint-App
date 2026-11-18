@@ -1,0 +1,5 @@
+add_executable(gas_bench Bench.cpp)
+target_link_libraries(gas_bench PRIVATE gas::core gas_warnings)
+if(WIN32)
+    target_link_libraries(gas_bench PRIVATE psapi)
+endif()

@@ -6,12 +6,23 @@
 #include "SlicesPanel.h"
 #include "TimelinePanel.h"
 #include "VectorTools.h"
+#include "PluginUi.h"
+#include "RecoveryDialog.h"
 
 #include <gas/core/Document.h>
+#include <gas/core/Plugins.h>
 #include <gas/core/ProjectIO.h>
+#include <gas/core/Recovery.h>
 #include <gas/core/Slicing.h>
 
 #include <QActionGroup>
+#include <QCoreApplication>
+#include <QDateTime>
+#include <QDesktopServices>
+#include <QLockFile>
+#include <QStandardPaths>
+#include <QUrl>
+#include <QUuid>
 #include <QCheckBox>
 #include <QComboBox>
 #include <QCloseEvent>
@@ -190,7 +201,23 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     createActions();
     createToolBars();
     createDocks();
+    loadPlugins();
     setDocument(std::make_unique<gas::Document>(kDefaultCanvasSize, kDefaultCanvasSize), QString());
+
+    // Crash recovery: this window autosaves into its own session slot, guarded
+    // by a lock file so other running windows never offer it for recovery.
+    recovery_ = std::make_unique<gas::RecoveryStore>(toFsPath(recoveryFolder()));
+    session_ = QUuid::createUuid().toString(QUuid::Id128).toStdString();
+    QDir().mkpath(recoveryFolder());
+    sessionLock_ = std::make_unique<QLockFile>(recoveryFolder() + QStringLiteral("/%1.lock").arg(QString::fromStdString(session_)));
+    sessionLock_->setStaleLockTime(0);
+    sessionLock_->tryLock(0);
+    autosaveTimer_ = new QTimer(this);
+    // Every minute; GAS_AUTOSAVE_SECONDS overrides it (QA, slow disks).
+    const int autosaveSeconds = qEnvironmentVariableIntValue("GAS_AUTOSAVE_SECONDS");
+    autosaveTimer_->setInterval((autosaveSeconds > 0 ? autosaveSeconds : 60) * 1000);
+    connect(autosaveTimer_, &QTimer::timeout, this, &MainWindow::autosave);
+    autosaveTimer_->start();
     selectTool(canvas_->tool());
     updateColorSwatch();
     updateStatus();
@@ -672,6 +699,7 @@ void MainWindow::setDocument(std::unique_ptr<gas::Document> document, const QStr
     timelinePanel_->setDocument(document.get());
     document_ = std::move(document);
     filePath_ = path;
+    autosavedGeneration_ = ~0u;
     onDocumentChanged();
 }
 
@@ -805,6 +833,30 @@ void MainWindow::open() {
 bool MainWindow::openFile(const QString& path) {
     gas::LoadResult result = gas::loadProject(toFsPath(path));
     if (!result.document) {
+        const std::filesystem::path backup = gas::backupPathFor(toFsPath(path));
+        std::error_code ec;
+        if (std::filesystem::exists(backup, ec)) {
+            // The previous save is kept as a backup: offer it.
+            const auto choice = QMessageBox::warning(
+                this, tr("Open Failed"),
+                tr("Could not open \"%1\":\n%2\n\nOpen the backup of the previous save instead?")
+                    .arg(QFileInfo(path).fileName(), QString::fromStdString(result.error)),
+                QMessageBox::Open | QMessageBox::Cancel, QMessageBox::Open);
+            if (choice == QMessageBox::Open) {
+                gas::LoadResult fromBackup = gas::loadProject(backup);
+                if (fromBackup.document) {
+                    setDocument(std::move(fromBackup.document), path);
+                    document_->markUnsaved(); // saving replaces the damaged file
+                    onDocumentChanged();
+                    statusBar()->showMessage(tr("Opened the backup of %1").arg(QFileInfo(path).fileName()), 5000);
+                    return true;
+                }
+                QMessageBox::warning(this, tr("Open Failed"),
+                                     tr("The backup could not be opened either:\n%1")
+                                         .arg(QString::fromStdString(fromBackup.error)));
+            }
+            return false;
+        }
         QMessageBox::warning(this, tr("Open Failed"),
                              tr("Could not open \"%1\":\n%2")
                                  .arg(QFileInfo(path).fileName(), QString::fromStdString(result.error)));
@@ -834,7 +886,8 @@ bool MainWindow::saveTo(const QString& path) {
     if (canvas_->isBusy()) {
         return false;
     }
-    const gas::IoResult result = gas::saveProject(*document_, toFsPath(path));
+    // The file being replaced is kept as "<name>.gas.bak".
+    const gas::IoResult result = gas::saveProject(*document_, toFsPath(path), {.backup = true});
     if (!result.ok) {
         QMessageBox::warning(this, tr("Save Failed"),
                              tr("Could not save \"%1\":\n%2")
@@ -843,6 +896,7 @@ bool MainWindow::saveTo(const QString& path) {
     }
     filePath_ = path;
     document_->markSaved();
+    clearAutosave(); // the file now holds everything
     onDocumentChanged();
     statusBar()->showMessage(tr("Saved %1").arg(QFileInfo(path).fileName()), 3000);
     return true;
@@ -874,6 +928,12 @@ void MainWindow::exportPng() {
 
 void MainWindow::closeEvent(QCloseEvent* event) {
     if (maybeSave()) {
+        // A clean exit leaves nothing to recover.
+        autosaveTimer_->stop();
+        clearAutosave();
+        if (sessionLock_) {
+            sessionLock_->unlock();
+        }
         event->accept();
     } else {
         event->ignore();
@@ -1548,4 +1608,185 @@ void MainWindow::nineSlicePreview() {
     lastH = height->value();
     lastZoom = zoom->value();
     lastTile = tile->isChecked();
+}
+
+// ---------------------------------------------------------------- crash recovery
+
+QString MainWindow::recoveryFolder() const {
+    return QStandardPaths::writableLocation(QStandardPaths::AppDataLocation) + QStringLiteral("/recovery");
+}
+
+void MainWindow::autosave() {
+    if (!document_ || !recovery_) {
+        return;
+    }
+    if (!document_->isModified()) {
+        clearAutosave(); // e.g. undone back to the saved state
+        return;
+    }
+    if (document_->historyGeneration() == autosavedGeneration_ || canvas_->isBusy() || canvas_->isTransforming()) {
+        return; // nothing new, or mid-stroke / mid-transform: try again next tick
+    }
+    const QString title = filePath_.isEmpty() ? tr("Untitled") : QFileInfo(filePath_).fileName();
+    const QByteArray original = filePath_.toUtf8();
+    const gas::IoResult r =
+        recovery_->save(*document_, session_, std::u8string(original.begin(), original.end()), title.toStdString(),
+                        QDateTime::currentSecsSinceEpoch());
+    if (r.ok) {
+        autosavedGeneration_ = document_->historyGeneration();
+        autosaveExists_ = true;
+        statusBar()->showMessage(tr("Autosaved"), 1500);
+    } else {
+        statusBar()->showMessage(tr("Autosave failed: %1").arg(QString::fromStdString(r.error)), 5000);
+    }
+}
+
+void MainWindow::clearAutosave() {
+    if (recovery_ && autosaveExists_) {
+        recovery_->remove(session_);
+        autosaveExists_ = false;
+    }
+    autosavedGeneration_ = ~0u;
+}
+
+void MainWindow::offerRecovery() {
+    if (!recovery_) {
+        return;
+    }
+    // Sessions whose lock can be taken belong to windows that are gone.
+    std::vector<gas::RecoveryEntry> orphans;
+    for (gas::RecoveryEntry& e : recovery_->entries()) {
+        if (e.session == session_) {
+            continue;
+        }
+        QLockFile probe(recoveryFolder() + QStringLiteral("/%1.lock").arg(QString::fromStdString(e.session)));
+        probe.setStaleLockTime(0); // only a dead owner makes a lock stale, never its age
+        if (probe.tryLock(0)) {
+            probe.unlock(); // removes the lock file
+            orphans.push_back(std::move(e));
+        }
+    }
+    if (orphans.empty()) {
+        return;
+    }
+    RecoveryDialog dialog(*recovery_, std::move(orphans), this);
+    if (dialog.exec() != QDialog::Accepted || dialog.choice() != RecoveryDialog::Choice::Recover) {
+        return;
+    }
+    const gas::RecoveryEntry entry = dialog.selected();
+    if (!maybeSave()) {
+        return;
+    }
+    gas::LoadResult loaded = gas::loadProject(entry.project);
+    if (!loaded.document) {
+        QMessageBox::warning(this, tr("Recovery Failed"),
+                             tr("The autosave could not be opened:\n%1").arg(QString::fromStdString(loaded.error)));
+        return;
+    }
+    const QString original = QString::fromUtf8(reinterpret_cast<const char*>(entry.originalPath.data()),
+                                               static_cast<qsizetype>(entry.originalPath.size()));
+    setDocument(std::move(loaded.document), original);
+    document_->markUnsaved(); // differs from the file on disk (if any) until saved
+    onDocumentChanged();
+    // Move it into this session's slot before deleting the old one, so a
+    // second crash can't lose it.
+    autosave();
+    if (autosaveExists_) {
+        recovery_->remove(entry.session);
+    }
+    statusBar()->showMessage(tr("Recovered \"%1\". Save it to keep the changes.")
+                                 .arg(original.isEmpty() ? tr("Untitled") : QFileInfo(original).fileName()),
+                             8000);
+}
+
+// ---------------------------------------------------------------- plugins
+
+QString MainWindow::userPluginFolder() const {
+    return QStandardPaths::writableLocation(QStandardPaths::AppDataLocation) + QStringLiteral("/plugins");
+}
+
+void MainWindow::loadPlugins() {
+    plugins_ = std::make_unique<gas::PluginHost>();
+    plugins_->loadDirectory(toFsPath(QCoreApplication::applicationDirPath() + QStringLiteral("/plugins")));
+    QDir().mkpath(userPluginFolder());
+    plugins_->loadDirectory(toFsPath(userPluginFolder()));
+
+    pluginsMenu_ = menuBar()->addMenu(tr("&Plugins"));
+    const auto& filters = plugins_->filters();
+    for (int i = 0; i < static_cast<int>(filters.size()); ++i) {
+        const gas::PluginFilter& f = filters[static_cast<std::size_t>(i)];
+        QAction* a = pluginsMenu_->addAction(QString::fromStdString(f.name) + (f.params.empty() ? QString()
+                                                                                                : QStringLiteral("...")),
+                                             this, [this, i] { runPluginFilter(i); });
+        a->setToolTip(QString::fromStdString(f.description));
+        a->setStatusTip(QString::fromStdString(f.description));
+        documentActions_ << a;
+    }
+    if (filters.empty()) {
+        pluginsMenu_->addAction(tr("(no filter plugins)"))->setEnabled(false);
+    }
+    const auto& exporters = plugins_->exporters();
+    if (!exporters.empty()) {
+        pluginsMenu_->addSeparator();
+        for (int i = 0; i < static_cast<int>(exporters.size()); ++i) {
+            documentActions_ << pluginsMenu_->addAction(
+                tr("Export %1...").arg(QString::fromStdString(exporters[static_cast<std::size_t>(i)].name)), this,
+                [this, i] { runPluginExporter(i); });
+        }
+    }
+    pluginsMenu_->addSeparator();
+    pluginsMenu_->addAction(tr("Open Plugins Folder"), this, [this] {
+        QDesktopServices::openUrl(QUrl::fromLocalFile(userPluginFolder()));
+    });
+    pluginsMenu_->addAction(tr("About Plugins..."), this,
+                            [this] { showPluginInfo(this, *plugins_, QDir::toNativeSeparators(userPluginFolder())); });
+}
+
+void MainWindow::runPluginFilter(int index) {
+    const gas::PluginFilter& filter = plugins_->filters().at(static_cast<std::size_t>(index));
+    settleCanvas();
+    if (canvas_->isBusy()) {
+        return;
+    }
+    auto it = filterValues_.find(index);
+    std::vector<double> values = it != filterValues_.end() ? *it : filter.defaults();
+    if (!filter.params.empty()) {
+        if (!editFilterParams(this, filter, values)) {
+            return;
+        }
+        filterValues_[index] = values;
+    }
+    const gas::IoResult r = gas::applyPluginFilter(*document_, filter, values);
+    if (!r.ok) {
+        QMessageBox::warning(this, QString::fromStdString(filter.name), QString::fromStdString(r.error));
+    }
+    onDocumentChanged();
+}
+
+void MainWindow::runPluginExporter(int index) {
+    const gas::PluginExporter& exporter = plugins_->exporters().at(static_cast<std::size_t>(index));
+    settleCanvas();
+    const QString ext = QString::fromStdString(exporter.extension);
+    QString suggested = filePath_.isEmpty() ? tr("Untitled") : filePath_;
+    if (suggested.endsWith(QLatin1String(gas::kProjectExtension), Qt::CaseInsensitive)) {
+        suggested.chop(static_cast<int>(std::char_traits<char>::length(gas::kProjectExtension)));
+    }
+    suggested += ext;
+    const QString filter = exporter.fileFilter.empty() ? tr("All files (*)") : QString::fromStdString(exporter.fileFilter);
+    QString path = QFileDialog::getSaveFileName(this, tr("Export %1").arg(QString::fromStdString(exporter.name)),
+                                                suggested, filter);
+    if (path.isEmpty()) {
+        return;
+    }
+    if (!ext.isEmpty() && !path.endsWith(ext, Qt::CaseInsensitive)) {
+        path += ext;
+    }
+    const gas::IoResult r = gas::runPluginExporter(*document_, exporter, toFsPath(path));
+    if (!r.ok) {
+        QMessageBox::warning(this, tr("Export Failed"),
+                             tr("Could not export \"%1\":\n%2")
+                                 .arg(QFileInfo(path).fileName(), QString::fromStdString(r.error)));
+        return;
+    }
+    statusBar()->showMessage(tr("Exported %1").arg(QFileInfo(path).fileName()), 3000);
 }

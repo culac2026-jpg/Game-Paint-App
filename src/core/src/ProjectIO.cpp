@@ -209,7 +209,13 @@ std::string readTiles(ByteReader& r, TiledImage& image) {
 
 // ------------------------------------------------------------ atomic write
 
-IoResult writeFileAtomic(const fs::path& path, const std::vector<std::uint8_t>& bytes) {
+fs::path backupPathFor(const fs::path& path) {
+    fs::path bak = path;
+    bak += ".bak";
+    return bak;
+}
+
+IoResult writeFileAtomic(const fs::path& path, const std::vector<std::uint8_t>& bytes, const fs::path& backup) {
     fs::path tmp = path;
     tmp += ".tmp";
     {
@@ -227,10 +233,23 @@ IoResult writeFileAtomic(const fs::path& path, const std::vector<std::uint8_t>& 
         }
     }
     std::error_code ec;
+    bool backedUp = false;
+    if (!backup.empty() && fs::exists(path, ec)) {
+        fs::rename(path, backup, ec); // replaces an older backup
+        if (ec) {
+            std::error_code ignored;
+            fs::remove(tmp, ignored);
+            return {false, "Failed to keep a backup: " + ec.message()};
+        }
+        backedUp = true;
+    }
     fs::rename(tmp, path, ec); // replaces an existing target
     if (ec) {
         std::error_code ignored;
         fs::remove(tmp, ignored);
+        if (backedUp) {
+            fs::rename(backup, path, ignored); // put the original back
+        }
         return {false, "Failed to replace the file: " + ec.message()};
     }
     return {true, {}};
@@ -238,7 +257,27 @@ IoResult writeFileAtomic(const fs::path& path, const std::vector<std::uint8_t>& 
 
 // ------------------------------------------------------------ project save
 
-IoResult saveProject(const Document& doc, const fs::path& path) {
+namespace {
+IoResult serializeInto(const Document& doc, std::vector<std::uint8_t>& out);
+} // namespace
+
+IoResult saveProject(const Document& doc, const fs::path& path, SaveOptions options) {
+    std::vector<std::uint8_t> bytes;
+    if (IoResult r = serializeInto(doc, bytes); !r.ok) {
+        return r;
+    }
+    return writeFileAtomic(path, bytes, options.backup ? backupPathFor(path) : fs::path{});
+}
+
+std::vector<std::uint8_t> serializeProject(const Document& doc) {
+    std::vector<std::uint8_t> bytes;
+    serializeInto(doc, bytes);
+    return bytes;
+}
+
+namespace {
+
+IoResult serializeInto(const Document& doc, std::vector<std::uint8_t>& out) {
     ByteWriter w;
     w.raw(kMagic.data(), kMagic.size());
     w.u32(kProjectFormatVersion);
@@ -398,8 +437,11 @@ IoResult saveProject(const Document& doc, const fs::path& path) {
     }
     w.chunk(kChunkEnd, ByteWriter{});
     w.u32(crc32Of(w.bytes.data(), w.bytes.size()));
-    return writeFileAtomic(path, w.bytes);
+    out = std::move(w.bytes);
+    return {true, {}};
 }
+
+} // namespace
 
 // ------------------------------------------------------------ project load
 
@@ -412,17 +454,20 @@ LoadResult loadProject(const fs::path& path) {
     if (in.bad()) {
         return fail("Failed to read the file");
     }
-    if (data.size() < kMagic.size() + 4 + 4 ||
-        std::memcmp(data.data(), kMagic.data(), kMagic.size()) != 0) {
+    return parseProject(data.data(), data.size());
+}
+
+LoadResult parseProject(const std::uint8_t* data, std::size_t dataSize) {
+    if (!data || dataSize < kMagic.size() + 4 + 4 || std::memcmp(data, kMagic.data(), kMagic.size()) != 0) {
         return fail("Not a GameArt Studio project");
     }
-    const std::size_t bodySize = data.size() - 4;
-    ByteReader trailer(data.data() + bodySize, 4);
-    if (trailer.u32() != crc32Of(data.data(), bodySize)) {
+    const std::size_t bodySize = dataSize - 4;
+    ByteReader trailer(data + bodySize, 4);
+    if (trailer.u32() != crc32Of(data, bodySize)) {
         return fail("The file is damaged (checksum mismatch)");
     }
 
-    ByteReader r(data.data() + kMagic.size(), bodySize - kMagic.size());
+    ByteReader r(data + kMagic.size(), bodySize - kMagic.size());
     const std::uint32_t version = r.u32();
     if (version == 0) {
         return fail("Invalid project format version");
@@ -658,6 +703,7 @@ LoadResult loadProject(const fs::path& path) {
                 s.style.strokeWidth = std::isfinite(strokeW) ? std::clamp(strokeW, 0.0, 10000.0) : 1.0;
                 shapes.push_back(std::move(s));
             }
+            shapes = sanitizedShapes(std::move(shapes));
             layers[index].image = rasterizeShapes(shapes, width, height);
             layers[index].vector = std::make_shared<const VectorShapes>(std::move(shapes));
         } else if (tag == kChunkSliceBorders) {

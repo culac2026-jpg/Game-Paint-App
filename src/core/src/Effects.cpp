@@ -508,7 +508,9 @@ Effect Effect::make(EffectType type) {
 
 Effect sanitized(Effect e) {
     const auto fix = [](double v, double lo, double hi, double fallback) {
-        return std::isfinite(v) ? std::clamp(v, lo, hi) : fallback;
+        // Rounded to float precision: what the project file stores, so a
+        // document renders identically after Save/Open.
+        return static_cast<double>(static_cast<float>(std::isfinite(v) ? std::clamp(v, lo, hi) : fallback));
     };
     if (static_cast<int>(e.type) >= kEffectTypeCount) {
         e.type = EffectType::Outline;

@@ -11,6 +11,8 @@
 
 namespace gas {
 class Document;
+class PluginHost;
+class RecoveryStore;
 }
 
 class BrushPanel;
@@ -24,6 +26,9 @@ class QCheckBox;
 class QComboBox;
 class QDockWidget;
 class QLabel;
+class QLockFile;
+class QMenu;
+class QTimer;
 class QSpinBox;
 class QToolButton;
 
@@ -38,6 +43,8 @@ public:
     bool openFile(const QString& path);
     // Imports image files: one -> a new document; several -> a sheet with one slice each.
     void importImageFiles(const QStringList& paths);
+    // Offers autosaved documents left behind by a crash (call once after show()).
+    void offerRecovery();
 
 protected:
     void closeEvent(QCloseEvent* event) override;
@@ -66,6 +73,15 @@ private:
     void exportLayers();
     void exportFrames();
     void exportSvg();
+    // Crash recovery: autosave the document into this session's slot.
+    void autosave();
+    void clearAutosave();
+    QString recoveryFolder() const;
+    // Plugins.
+    void loadPlugins();
+    void runPluginFilter(int index);
+    void runPluginExporter(int index);
+    QString userPluginFolder() const;
     void nineSlicePreview();
     void runFrameCommand(void (TimelinePanel::*command)());
     QString documentBaseName() const; // file stem, or "sprite"
@@ -100,6 +116,15 @@ private:
     TimelinePanel* timelinePanel_ = nullptr;
     QAction* onionAction_ = nullptr;
     VectorOptions* vectorOptions_ = nullptr;
+    std::unique_ptr<gas::RecoveryStore> recovery_;
+    std::string session_;
+    std::unique_ptr<QLockFile> sessionLock_;
+    QTimer* autosaveTimer_ = nullptr;
+    unsigned autosavedGeneration_ = ~0u;
+    bool autosaveExists_ = false;
+    std::unique_ptr<gas::PluginHost> plugins_;
+    QMenu* pluginsMenu_ = nullptr;
+    QHash<int, std::vector<double>> filterValues_;
     QAction* vectorOptionsAction_ = nullptr;
     int atlasContent_ = -1;   // 0 = slices of this frame, 1 = animation frames (-1 = pick by document)
     int atlasFramePivot_ = 1; // pivot preset for whole-canvas frames (bottom centre)

@@ -105,7 +105,7 @@ TEST(DocumentSlices, UndoRedoClipAndMerge) {
         doc.setSlices(s, "Slice Pivot", true);
     }
     EXPECT_EQ(doc.undoSteps(), 2); // the five pivot edits merged into one
-    EXPECT_DOUBLE_EQ(doc.slices()[0].pivot.y, 0.4);
+    EXPECT_FLOAT_EQ(static_cast<float>(doc.slices()[0].pivot.y), 0.4f); // stored at float precision
     doc.undo();
     EXPECT_DOUBLE_EQ(doc.slices()[0].pivot.y, 0.5);
     doc.undo();

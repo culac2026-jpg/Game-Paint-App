@@ -73,8 +73,21 @@ struct LoadResult {
     std::string error;
 };
 
-IoResult saveProject(const Document& document, const std::filesystem::path& path);
+struct SaveOptions {
+    // Keep the file being replaced as "<path>.bak" (one generation).
+    bool backup = false;
+};
+
+IoResult saveProject(const Document& document, const std::filesystem::path& path, SaveOptions options = {});
 LoadResult loadProject(const std::filesystem::path& path);
+// The in-memory form of a .gas file (what saveProject writes / loadProject
+// reads). parseProject never trusts its input: damaged or hostile bytes give
+// an error, never a crash or an unbounded allocation. serializeProject
+// returns an empty vector if the document can't be saved.
+std::vector<std::uint8_t> serializeProject(const Document& document);
+LoadResult parseProject(const std::uint8_t* data, std::size_t size);
+// "<path>.bak": the previous version kept by SaveOptions::backup.
+std::filesystem::path backupPathFor(const std::filesystem::path& path);
 
 // Flattened visible layers as an 8-bit RGBA PNG (straight alpha, exact pixels).
 IoResult exportPng(const Document& document, const std::filesystem::path& path);
@@ -86,7 +99,9 @@ std::vector<std::uint8_t> encodePng(int width, int height, const std::vector<Rgb
 std::string svgDocument(const Document& document);
 IoResult exportSvg(const Document& document, const std::filesystem::path& path);
 
-// Writes via a temporary sibling + rename. Exposed for tests.
-IoResult writeFileAtomic(const std::filesystem::path& path, const std::vector<std::uint8_t>& bytes);
+// Writes via a temporary sibling + rename. With `backup`, an existing file is
+// first renamed to `backup` (and put back if the final rename fails).
+IoResult writeFileAtomic(const std::filesystem::path& path, const std::vector<std::uint8_t>& bytes,
+                         const std::filesystem::path& backup = {});
 
 } // namespace gas

@@ -1,9 +1,9 @@
 cmake_minimum_required(VERSION 3.21)
 
 project(GameArtStudio
-    VERSION 0.9.0
+    VERSION 1.0.0
     DESCRIPTION "Desktop editor for 2D game assets"
-    LANGUAGES CXX)
+    LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -12,6 +12,8 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 option(GAS_BUILD_APP   "Build the Qt desktop application" ON)
 option(GAS_BUILD_TESTS "Build unit tests for the core library" ON)
+option(GAS_BUILD_BENCH "Build the gas_bench performance tool" ON)
+option(GAS_BUILD_PLUGINS "Build the sample plugin" ON)
 option(GAS_DEPLOY_RUNTIME "Copy Qt and toolchain DLLs next to the app after each build (Windows)" ON)
 
 # MSYS2/MinGW: search the toolchain's own prefix (e.g. C:/msys64/ucrt64) for
@@ -35,6 +37,14 @@ endif()
 
 # Core must stay free of Qt and OpenGL (see CLAUDE.md).
 add_subdirectory(src/core)
+
+if(GAS_BUILD_BENCH)
+    add_subdirectory(bench)
+endif()
+
+if(GAS_BUILD_PLUGINS)
+    add_subdirectory(plugins)
+endif()
 
 if(GAS_BUILD_APP)
     add_subdirectory(src/app)

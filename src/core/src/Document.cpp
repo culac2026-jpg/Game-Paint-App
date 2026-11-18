@@ -372,7 +372,8 @@ bool Document::setLayerProps(int index, const LayerProps& props) {
         return false;
     }
     LayerProps clean = props;
-    clean.opacity = std::clamp(clean.opacity, 0.0, 1.0);
+    // Float precision, as stored in project files (exact Save/Open round trip).
+    clean.opacity = static_cast<float>(std::isfinite(clean.opacity) ? std::clamp(clean.opacity, 0.0, 1.0) : 1.0);
     for (Effect& e : clean.effects) {
         e = sanitized(e);
     }
@@ -529,6 +530,7 @@ bool Document::addVectorLayer(VectorShapes shapes, const std::string& label) {
     }
     const int index = activeLayer_ + 1;
     const int prevActive = activeLayer_;
+    shapes = sanitizedShapes(std::move(shapes));
     Layer layer(namedProps("Vector " + std::to_string(createdLayers_ + 1)), rasterizeShapes(shapes, width_, height_));
     layer.vector = std::make_shared<const VectorShapes>(std::move(shapes));
     normalizeLayer(layer);
@@ -552,6 +554,7 @@ bool Document::setVectorShapes(int index, VectorShapes shapes, const std::string
         return false;
     }
     Layer& l = layers_[static_cast<std::size_t>(index)];
+    shapes = sanitizedShapes(std::move(shapes));
     if (*l.vector == shapes) {
         return false;
     }
@@ -1239,7 +1242,9 @@ void Document::restoreAnimation(std::vector<Frame> frames, std::vector<std::vect
 std::vector<Slice> Document::sanitizedSlices(std::vector<Slice> slices) const {
     std::vector<Slice> out;
     out.reserve(slices.size());
-    const auto clampPivot = [](double v) { return std::isfinite(v) ? std::clamp(v, -4.0, 5.0) : 0.5; };
+    const auto clampPivot = [](double v) {
+        return static_cast<double>(static_cast<float>(std::isfinite(v) ? std::clamp(v, -4.0, 5.0) : 0.5)); // as stored
+    };
     for (Slice& s : slices) {
         s.rect = s.rect.intersected({0, 0, width_, height_});
         if (s.rect.empty()) {

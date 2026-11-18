@@ -32,9 +32,20 @@ add_executable(gas_core_tests
     AnimationTest.cpp
     VectorTest.cpp
     EffectsTest.cpp
+    RecoveryTest.cpp
+    PluginTest.cpp
+    QATest.cpp
 )
 find_package(ZLIB REQUIRED) # the PNG test decodes with zlib directly
 target_link_libraries(gas_core_tests PRIVATE gas::core gas_warnings GTest::gtest_main ZLIB::ZLIB)
+
+# The plugin test loads the real sample plugin DLL.
+if(TARGET gas_sample_plugin)
+    add_dependencies(gas_core_tests gas_sample_plugin)
+    target_compile_definitions(gas_core_tests PRIVATE GAS_SAMPLE_PLUGIN="$<TARGET_FILE:gas_sample_plugin>")
+else()
+    target_compile_definitions(gas_core_tests PRIVATE GAS_SAMPLE_PLUGIN="")
+endif()
 
 include(GoogleTest)
 gtest_discover_tests(gas_core_tests)
