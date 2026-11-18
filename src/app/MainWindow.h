@@ -2,6 +2,7 @@
 
 #include "CanvasWidget.h"
 
+#include <QHash>
 #include <QMainWindow>
 
 #include <memory>
@@ -11,6 +12,7 @@ class Document;
 }
 
 class BrushPanel;
+class EffectsPanel;
 class LayersPanel;
 class QAction;
 class QCheckBox;
@@ -57,6 +59,8 @@ private:
     // Refreshes the views if a document command changed anything.
     void runCommand(bool changed);
     void cropToSelection();
+    void defineBrushTip();
+    void featherSelection();
     // Re-syncs every view of the document (title, undo actions, layers, canvas).
     void onDocumentChanged();
 
@@ -69,10 +73,13 @@ private:
     CanvasWidget* canvas_ = nullptr;
     LayersPanel* layersPanel_ = nullptr;
     BrushPanel* brushPanel_ = nullptr;
+    EffectsPanel* effectsPanel_ = nullptr;
     QLabel* zoomLabel_ = nullptr;
+    QLabel* opacityLabel_ = nullptr;
     QLabel* cursorLabel_ = nullptr;
     QAction* undoAction_ = nullptr;
     QAction* redoAction_ = nullptr;
+    QHash<int, QAction*> toolActions_; // palette action per Tool
     QList<QAction*> documentActions_; // disabled while a transform is open
 
     QToolButton* colorButton_ = nullptr;

@@ -25,6 +25,12 @@ class Document;
 //     "LPRP" (version 3+) optional, after its layer: u32 layerIndex,
 //            u8 blendMode (BlendMode value; unknown = Normal); readers
 //            ignore any further bytes, so fields can be appended
+//     "LEFX" (version 4+) optional, after its layer: u32 layerIndex,
+//            u16 effectCount, then per effect: u8 type, u8 flags
+//            (1 = enabled, 2 = smooth), u8 r, g, b, a (colour), u16 floatCount,
+//            f32 x floatCount: opacity, size, offsetX, offsetY, hue,
+//            saturation, lightness, contrast (extra floats are skipped;
+//            effects of unknown type are dropped)
 //     "END "
 //   u32 CRC-32 of every preceding byte
 //
@@ -34,9 +40,9 @@ class Document;
 // Only non-empty tiles are stored. Saves are atomic: written to a temporary
 // sibling file, then renamed over the target, so a failed save never damages
 // an existing file. Undo history and the selection are not saved.
-// Version history: 1 = v0.3 (layers), 2 = v0.4 (layer masks), 3 = v0.5 (blend modes). Older versions
+// Version history: 1 = v0.3 (layers), 2 = v0.4 (layer masks), 3 = v0.5 (blend modes), 4 = v0.6 (layer effects). Older versions
 // still load; newer ones are refused.
-inline constexpr std::uint32_t kProjectFormatVersion = 3;
+inline constexpr std::uint32_t kProjectFormatVersion = 4;
 inline constexpr const char* kProjectExtension = ".gas";
 
 struct IoResult {

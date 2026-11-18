@@ -1,9 +1,11 @@
 #include <gas/core/Brush.h>
 #include <gas/core/BrushPresets.h>
+#include <gas/core/Selection.h>
 #include <gas/core/StrokeSmoother.h>
 
 #include <gtest/gtest.h>
 
+#include <cmath>
 #include <set>
 
 using gas::BrushSettings;
@@ -261,4 +263,142 @@ TEST(BrushPresets, ParserIsTolerant) {
     EXPECT_EQ(presets[0].settings.opacity, 1.0);
     EXPECT_EQ(presets[0].settings.blendMode, gas::BlendMode::Normal);
     EXPECT_TRUE(gas::parseBrushPresets("").empty());
+}
+
+namespace {
+
+// One hard dab of `shape` (diameter 20) at the centre of a 100x100 image.
+std::unique_ptr<TiledImage> stampShape(gas::BrushShape shape, double angle = 0.0) {
+    auto img = std::make_unique<TiledImage>(100, 100);
+    BrushTool brush;
+    brush.setColor(kRed);
+    brush.settings().diameter = 20;
+    brush.settings().hardness = 1.0;
+    brush.settings().shape = shape;
+    brush.settings().angle = angle;
+    brush.begin(*img, {50, 50});
+    brush.end();
+    return img;
+}
+
+bool painted(const TiledImage& img, int x, int y) { return img.pixel({x, y}).a > 127; }
+
+} // namespace
+
+TEST(BrushShapes, BuiltInShapes) {
+    const auto round = stampShape(gas::BrushShape::Round);
+    const auto square = stampShape(gas::BrushShape::Square);
+    // Pixel (58,58) has its centre 8.5 px from the dab centre on both axes.
+    EXPECT_FALSE(painted(*round, 58, 58));
+    EXPECT_TRUE(painted(*square, 58, 58));
+
+    const auto diamond = stampShape(gas::BrushShape::Diamond);
+    EXPECT_TRUE(painted(*diamond, 57, 50));  // on an axis, inside the tip
+    EXPECT_FALSE(painted(*diamond, 56, 56)); // diagonal: |x|+|y| = 13 > 10
+
+    const auto triangle = stampShape(gas::BrushShape::Triangle); // apex up
+    EXPECT_TRUE(painted(*triangle, 50, 42));  // towards the apex (y = 40)
+    EXPECT_TRUE(painted(*triangle, 50, 53));
+    EXPECT_FALSE(painted(*triangle, 50, 57)); // below the base (y = 55)
+
+    const auto star = stampShape(gas::BrushShape::Star); // a point straight up
+    EXPECT_TRUE(painted(*star, 50, 50));
+    EXPECT_TRUE(painted(*star, 50, 42)); // along a point
+    // Between two points (at -54 degrees) 7 px out is past the inner radius 4.5.
+    EXPECT_FALSE(painted(*star, 50 + static_cast<int>(std::lround(7 * std::cos(-0.9425))),
+                         50 + static_cast<int>(std::lround(7 * std::sin(-0.9425)))));
+
+    const auto hexagon = stampShape(gas::BrushShape::Hexagon);
+    EXPECT_TRUE(painted(*hexagon, 58, 50));  // vertex direction (x axis)
+    EXPECT_FALSE(painted(*hexagon, 50, 59)); // flat side at y = 8.66
+}
+
+TEST(BrushShapes, AngleRotatesShape) {
+    const auto square = stampShape(gas::BrushShape::Square);
+    const auto turned = stampShape(gas::BrushShape::Square, 45); // now a diamond
+    EXPECT_TRUE(painted(*square, 58, 58));
+    EXPECT_FALSE(painted(*turned, 58, 58));
+    EXPECT_TRUE(painted(*turned, 62, 50)); // corner on the x axis reaches ~14 px
+}
+
+TEST(BrushShapes, EdgesStayAntialiased) {
+    const auto star = stampShape(gas::BrushShape::Star);
+    int partial = 0;
+    for (int y = 35; y < 65; ++y) {
+        for (int x = 35; x < 65; ++x) {
+            const int a = star->pixel({x, y}).a;
+            partial += a > 0 && a < 255 ? 1 : 0;
+        }
+    }
+    EXPECT_GT(partial, 20);
+}
+
+TEST(BrushShapes, CustomTipFromImage) {
+    // An "L" drawn on a layer becomes the tip.
+    TiledImage src(64, 64);
+    for (int y = 10; y < 30; ++y) {
+        src.setPixel({10, y}, kRed);
+        src.setPixel({11, y}, kRed);
+    }
+    for (int x = 10; x < 30; ++x) {
+        src.setPixel({x, 28}, kRed);
+        src.setPixel({x, 29}, kRed);
+    }
+    const gas::BrushTip tip = gas::brushTipFromImage(src, {0, 0, 64, 64});
+    ASSERT_EQ(tip.width, 20); // trimmed to the content
+    ASSERT_EQ(tip.height, 20);
+    EXPECT_EQ(tip.alpha[0], 255);       // top-left of the L
+    EXPECT_EQ(tip.alpha[10], 0);        // empty interior
+    EXPECT_TRUE(gas::brushTipFromImage(src, {40, 40, 10, 10}).empty());
+
+    TiledImage img(100, 100);
+    BrushTool brush;
+    brush.setColor(kRed);
+    brush.settings().shape = gas::BrushShape::Custom;
+    brush.settings().tip.tip = std::make_shared<const gas::BrushTip>(tip);
+    brush.settings().diameter = 40; // 2x the tip
+    brush.begin(img, {50, 50});
+    brush.end();
+    EXPECT_TRUE(painted(img, 32, 35));   // vertical bar of the L (left edge)
+    EXPECT_TRUE(painted(img, 60, 67));   // horizontal bar (bottom)
+    EXPECT_FALSE(painted(img, 55, 45));  // inside the L's corner: empty
+
+    // A custom shape without a tip falls back to round.
+    TiledImage fallback(100, 100);
+    BrushTool plain;
+    plain.settings().shape = gas::BrushShape::Custom;
+    plain.settings().diameter = 20;
+    plain.begin(fallback, {50, 50});
+    plain.end();
+    EXPECT_TRUE(painted(fallback, 50, 50));
+}
+
+TEST(BrushShapes, TipFromSelectionAndDownscale) {
+    TiledImage src(1200, 300);
+    for (int y = 0; y < 300; ++y) {
+        for (int x = 0; x < 1200; ++x) {
+            src.setPixel({x, y}, kRed);
+        }
+    }
+    const auto sel = gas::Selection::rect(1200, 300, {100, 100, 50, 50});
+    const gas::BrushTip small = gas::brushTipFromImage(src, {0, 0, 1200, 300}, &sel);
+    EXPECT_EQ(small.width, 50);
+    EXPECT_EQ(small.height, 50);
+    const gas::BrushTip big = gas::brushTipFromImage(src, {0, 0, 1200, 300});
+    EXPECT_LE(big.width, gas::BrushTip::kMaxSize);
+    EXPECT_EQ(big.width, 400); // factor 3
+    EXPECT_EQ(big.height, 100);
+}
+
+TEST(BrushShapes, PresetsKeepShapeAndTip) {
+    gas::BrushPreset p{"Stamp", {}};
+    p.settings.shape = gas::BrushShape::Custom;
+    p.settings.tip.tip = std::make_shared<const gas::BrushTip>(gas::BrushTip{3, 2, {0, 64, 128, 192, 255, 7}});
+    gas::BrushPreset q{"Stars", {}};
+    q.settings.shape = gas::BrushShape::Star;
+    const auto parsed = gas::parseBrushPresets(gas::serializeBrushPresets({p, q}));
+    ASSERT_EQ(parsed.size(), 2u);
+    EXPECT_EQ(parsed[0], p); // tips compare by content
+    EXPECT_EQ(parsed[1], q);
+    EXPECT_EQ(gas::parseBrushPresets("[preset]\nname = X\ntip = 2 2 !!!!\n")[0].settings.tip.tip, nullptr);
 }

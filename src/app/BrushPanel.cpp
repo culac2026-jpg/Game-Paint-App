@@ -3,6 +3,7 @@
 #include "CanvasWidget.h"
 
 #include <QCheckBox>
+#include <QAbstractItemView>
 #include <QComboBox>
 #include <QDir>
 #include <QDoubleSpinBox>
@@ -13,6 +14,15 @@
 #include <QInputDialog>
 #include <QLabel>
 #include <QMessageBox>
+#include <QPixmap>
+#include <QImage>
+#include <QPainter>
+#include <QPalette>
+
+#include <gas/core/Brush.h>
+#include <gas/core/TiledImage.h>
+
+#include <cmath>
 #include <QSaveFile>
 #include <QSignalBlocker>
 #include <QStandardPaths>
@@ -26,6 +36,40 @@ namespace {
 // Combo item data: index into builtins (>= 0) or user presets (encoded as -1 - i).
 constexpr int kNoPreset = 1 << 30;
 
+// A short S-shaped stroke painted with `s`, for the preset menu (the size is
+// capped so big brushes still fit; pressure tapers at both ends).
+QIcon strokePreview(const gas::BrushSettings& settings, QColor colour) {
+    constexpr int kW = 150, kH = 30;
+    gas::TiledImage img(kW, kH);
+    gas::BrushTool brush;
+    gas::BrushSettings s = settings;
+    const double scale = std::min(1.0, 16.0 / std::max(s.diameter, 1.0));
+    s.diameter = std::max(2.0, s.diameter * scale);
+    s.mix = 0.0;
+    brush.settings() = s;
+    brush.setColor({static_cast<std::uint8_t>(colour.red()), static_cast<std::uint8_t>(colour.green()),
+                    static_cast<std::uint8_t>(colour.blue()), 255});
+    brush.setSeed(12345);
+    const auto at = [](double t) {
+        return gas::PointF{12 + t * (kW - 24), kH / 2.0 - 6.0 * std::sin(t * 2 * 3.14159265358979)};
+    };
+    const auto pressure = [](double t) { return 0.35 + 0.65 * std::sin(t * 3.14159265358979); };
+    brush.begin(img, at(0), pressure(0));
+    for (int i = 1; i <= 60; ++i) {
+        const double t = i / 60.0;
+        brush.moveTo(img, at(t), pressure(t));
+    }
+    brush.end();
+    QImage out(kW, kH, QImage::Format_RGBA8888);
+    for (int y = 0; y < kH; ++y) {
+        for (int x = 0; x < kW; ++x) {
+            const gas::Rgba8 p = img.pixel({x, y});
+            out.setPixelColor(x, y, QColor(p.r, p.g, p.b, p.a));
+        }
+    }
+    return QIcon(QPixmap::fromImage(out));
+}
+
 QString presetFilePath() {
     return QStandardPaths::writableLocation(QStandardPaths::AppDataLocation) + QStringLiteral("/brush-presets.txt");
 }
@@ -35,6 +79,10 @@ QString presetFilePath() {
 BrushPanel::BrushPanel(CanvasWidget* canvas, QWidget* parent) : QWidget(parent), canvas_(canvas) {
     presets_ = new QComboBox(this);
     presets_->setFocusPolicy(Qt::ClickFocus);
+    // The stroke previews are wide: keep the closed combo narrow, the popup roomy.
+    presets_->setSizeAdjustPolicy(QComboBox::AdjustToMinimumContentsLengthWithIcon);
+    presets_->setMinimumContentsLength(6);
+    presets_->view()->setMinimumWidth(330);
     presets_->setToolTip(tr("Load a brush preset"));
     saveButton_ = new QToolButton(this);
     saveButton_->setText(tr("Save..."));
@@ -71,6 +119,16 @@ BrushPanel::BrushPanel(CanvasWidget* canvas, QWidget* parent) : QWidget(parent),
             }
         });
     };
+    shape_ = new QComboBox(this);
+    shape_->setFocusPolicy(Qt::ClickFocus);
+    shape_->setToolTip(tr("Tip shape. Custom tips come from Edit > Define Brush Tip."));
+    for (int s = 0; s < gas::kBrushShapeCount; ++s) {
+        shape_->addItem(tr(gas::brushShapeName(static_cast<gas::BrushShape>(s)).data()), s);
+    }
+    form->addRow(tr("Shape"), shape_);
+    tipPreview_ = new QLabel(this);
+    tipPreview_->setToolTip(tr("Custom tip (Edit > Define Brush Tip)"));
+    form->addRow(QString(), tipPreview_);
     const QString pct = tr("%");
     addField(tr("Spacing"), &gas::BrushSettings::spacing, 1, 1000, 100, pct,
              tr("Distance between dabs, in percent of the dab size"));
@@ -99,8 +157,15 @@ BrushPanel::BrushPanel(CanvasWidget* canvas, QWidget* parent) : QWidget(parent),
         blendMode_->addItem(tr(gas::blendModeName(static_cast<gas::BlendMode>(m)).data()), m);
     }
     form->addRow(tr("Blend"), blendMode_);
+    addField(tr("Wet mix"), &gas::BrushSettings::mix, 0, 100, 100, pct,
+             tr("Blend: the brush picks up and drags the colours already on the layer (oil, watercolour)"));
+    addField(tr("Grain"), &gas::BrushSettings::grain, 0, 100, 100, pct,
+             tr("Paper texture that breaks up the stroke (crayon, pencil)"));
+    addField(tr("Grain size"), &gas::BrushSettings::grainScale, 1, 64, 1, tr(" px"), tr("Size of the paper texture"));
+    addField(tr("Particles"), &gas::BrushSettings::particles, 0, 100, 100, pct,
+             tr("Airbrush: spray dots at this density instead of a solid dab"));
 
-    hint_ = new QLabel(tr("Select the Brush or Eraser to edit its settings."), this);
+    hint_ = new QLabel(tr("Select the Brush, Eraser, Smudge or Blur tool to edit its settings."), this);
     hint_->setWordWrap(true);
 
     auto* layout = new QVBoxLayout(this);
@@ -119,6 +184,13 @@ BrushPanel::BrushPanel(CanvasWidget* canvas, QWidget* parent) : QWidget(parent),
             Q_EMIT settingsChanged();
         }
     });
+    connect(shape_, &QComboBox::currentIndexChanged, this, [this](int i) {
+        if (gas::BrushSettings* s = settings()) {
+            s->shape = static_cast<gas::BrushShape>(shape_->itemData(i).toInt());
+            refresh();
+            Q_EMIT settingsChanged();
+        }
+    });
     connect(blendMode_, &QComboBox::currentIndexChanged, this, [this](int i) {
         if (gas::BrushSettings* s = settings()) {
             s->blendMode = static_cast<gas::BlendMode>(blendMode_->itemData(i).toInt());
@@ -132,7 +204,7 @@ BrushPanel::BrushPanel(CanvasWidget* canvas, QWidget* parent) : QWidget(parent),
 }
 
 bool BrushPanel::brushToolActive() const {
-    return canvas_->tool() == Tool::Brush || canvas_->tool() == Tool::Eraser;
+    return usesBrushSettings(canvas_->tool());
 }
 
 gas::BrushSettings* BrushPanel::settings() const {
@@ -155,10 +227,28 @@ void BrushPanel::refresh() {
         f.box->setValue(s->*f.member * f.scale);
     }
     {
-        const QSignalBlocker b1(followDirection_), b2(blendMode_);
+        const QSignalBlocker b1(followDirection_), b2(blendMode_), b3(shape_);
         followDirection_->setChecked(s->followDirection);
         blendMode_->setCurrentIndex(static_cast<int>(s->blendMode));
+        shape_->setCurrentIndex(static_cast<int>(s->shape));
     }
+    // Preview of the custom tip (white paint on a dark swatch).
+    const gas::BrushTip* tip = s->tip.tip.get();
+    const bool custom = s->shape == gas::BrushShape::Custom;
+    if (custom && tip && !tip->empty()) {
+        QImage img(tip->width, tip->height, QImage::Format_ARGB32);
+        for (int y = 0; y < tip->height; ++y) {
+            for (int x = 0; x < tip->width; ++x) {
+                const int a = tip->alpha[static_cast<std::size_t>(y * tip->width + x)];
+                img.setPixel(x, y, qRgb(40 + a * 215 / 255, 40 + a * 215 / 255, 40 + a * 215 / 255));
+            }
+        }
+        tipPreview_->setPixmap(QPixmap::fromImage(img.scaled(64, 64, Qt::KeepAspectRatio, Qt::SmoothTransformation)));
+    } else {
+        tipPreview_->setText(custom ? tr("No tip yet: select something and use Edit > Define Brush Tip.") : QString());
+        tipPreview_->setWordWrap(true);
+    }
+    tipPreview_->setVisible(custom);
     blendMode_->setEnabled(canvas_->tool() == Tool::Brush); // the eraser only removes alpha
     deleteButton_->setEnabled(!userPresets_.empty());
 }
@@ -166,15 +256,19 @@ void BrushPanel::refresh() {
 void BrushPanel::rebuildPresetList() {
     const QSignalBlocker block(presets_);
     presets_->clear();
-    presets_->addItem(tr("Presets..."), kNoPreset);
+    presets_->setIconSize(QSize(150, 30));
+    presets_->addItem(tr("Brush type..."), kNoPreset);
+    const QColor ink = palette().color(QPalette::Text);
     const auto& builtins = gas::builtinBrushPresets();
     for (int i = 0; i < static_cast<int>(builtins.size()); ++i) {
-        presets_->addItem(tr(builtins[static_cast<std::size_t>(i)].name.c_str()), i);
+        const gas::BrushPreset& p = builtins[static_cast<std::size_t>(i)];
+        presets_->addItem(strokePreview(p.settings, ink), tr(p.name.c_str()), i);
     }
     if (!userPresets_.empty()) {
         presets_->insertSeparator(presets_->count());
         for (int i = 0; i < static_cast<int>(userPresets_.size()); ++i) {
-            presets_->addItem(QString::fromStdString(userPresets_[static_cast<std::size_t>(i)].name), -1 - i);
+            const gas::BrushPreset& p = userPresets_[static_cast<std::size_t>(i)];
+            presets_->addItem(strokePreview(p.settings, ink), QString::fromStdString(p.name), -1 - i);
         }
     }
     presets_->setCurrentIndex(0);

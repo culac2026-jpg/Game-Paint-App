@@ -50,6 +50,9 @@ public:
     // The part inside `area`, as a selection of size area.w x area.h.
     Selection cropped(IRect area) const;
 
+    // Coverage blurred by about `radius` px (3-pass box blur), for soft edges.
+    Selection feathered(double radius) const;
+
     // Boundary of the region with coverage >= 128, as merged axis-aligned unit
     // edges on the pixel grid (for drawing marching ants).
     struct Segment {

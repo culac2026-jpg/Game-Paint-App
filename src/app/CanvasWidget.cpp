@@ -81,6 +81,8 @@ QString toolLabel(Tool tool) {
     case Tool::EllipseSelect: return CanvasWidget::tr("Elliptical Select");
     case Tool::Lasso: return CanvasWidget::tr("Lasso Select");
     case Tool::Move: return CanvasWidget::tr("Move");
+    case Tool::Smudge: return CanvasWidget::tr("Smudge");
+    case Tool::Blur: return CanvasWidget::tr("Blur");
     }
     return {};
 }
@@ -93,6 +95,13 @@ CanvasWidget::CanvasWidget(QWidget* parent)
     setMouseTracking(true);
     setFocusPolicy(Qt::StrongFocus);
     eraser_.settings().diameter = 24.0;
+    smudge_.settings().diameter = 24.0;
+    smudge_.settings().opacity = 0.6; // strength
+    smudge_.settings().hardness = 0.5;
+    blur_.settings().diameter = 30.0;
+    blur_.settings().opacity = 0.5;
+    blur_.settings().hardness = 0.3;
+    blur_.settings().spacing = 0.15;
     setForegroundColor(foreground_);
     updateCursorShape();
 
@@ -143,6 +152,18 @@ gas::StrokeTool* CanvasWidget::strokeTool() {
     case Tool::Pencil: return &pencil_;
     case Tool::Brush: return &brush_;
     case Tool::Eraser: return &eraser_;
+    case Tool::Smudge: return &smudge_;
+    case Tool::Blur: return &blur_;
+    default: return nullptr;
+    }
+}
+
+const gas::BrushTool* CanvasWidget::brushTool() const {
+    switch (tool_) {
+    case Tool::Brush: return &brush_;
+    case Tool::Eraser: return &eraser_;
+    case Tool::Smudge: return &smudge_;
+    case Tool::Blur: return &blur_;
     default: return nullptr;
     }
 }
@@ -167,7 +188,12 @@ void CanvasWidget::setForegroundColor(gas::Rgba8 color) {
 }
 
 gas::BrushSettings& CanvasWidget::brushSettings(Tool tool) {
-    return tool == Tool::Eraser ? eraser_.settings() : brush_.settings();
+    switch (tool) {
+    case Tool::Eraser: return eraser_.settings();
+    case Tool::Smudge: return smudge_.settings();
+    case Tool::Blur: return blur_.settings();
+    default: return brush_.settings();
+    }
 }
 
 void CanvasWidget::setDocument(gas::Document* document) {
@@ -322,21 +348,36 @@ void CanvasWidget::paintGL() {
 }
 
 void CanvasWidget::drawBrushOutline(QPainter& p) const {
-    if (!cursorPos_ || spaceHeld_ || panning_ || transform_ || (tool_ != Tool::Brush && tool_ != Tool::Eraser)) {
+    if (!cursorPos_ || spaceHeld_ || panning_ || transform_ || !usesBrushSettings(tool_)) {
         return;
     }
-    const gas::BrushTool& b = tool_ == Tool::Eraser ? eraser_ : brush_;
+    const gas::BrushTool& b = *brushTool();
+    const gas::BrushSettings& s = b.settings();
     const double r = b.effectiveDiameter() / 2.0 * viewport_.zoom();
     if (r < 3.0) {
         return; // the crosshair cursor is enough
     }
-    // Dark + light rings so the outline reads on any background.
+    // The tip's outline at the brush's angle and roundness (direction-following
+    // and jitter are per dab, so the cursor shows the base shape).
+    gas::BrushShape shape = s.shape;
+    if (shape == gas::BrushShape::Custom && (!s.tip.tip || s.tip.tip->empty())) {
+        shape = gas::BrushShape::Round;
+    }
+    const double angle = s.angle * std::numbers::pi / 180.0;
+    const double cs = std::cos(angle), sn = std::sin(angle);
+    const double roundness = std::clamp(s.roundness, 0.05, 1.0);
+    QPolygonF outline;
+    for (const gas::PointF& v : gas::brushShapeOutline(shape)) {
+        const double x = v.x * r, y = v.y * r * roundness;
+        outline << *cursorPos_ + QPointF(cs * x - sn * y, sn * x + cs * y);
+    }
+    // Dark + light lines so the outline reads on any background.
     p.setRenderHint(QPainter::Antialiasing, true);
     p.setBrush(Qt::NoBrush);
-    p.setPen(QPen(QColor(0, 0, 0, 160), 1.0));
-    p.drawEllipse(*cursorPos_, r + 0.5, r + 0.5);
-    p.setPen(QPen(QColor(255, 255, 255, 200), 1.0));
-    p.drawEllipse(*cursorPos_, r - 0.5, r - 0.5);
+    p.setPen(QPen(QColor(0, 0, 0, 170), 2.0));
+    p.drawPolygon(outline);
+    p.setPen(QPen(QColor(255, 255, 255, 220), 1.0));
+    p.drawPolygon(outline);
     p.setRenderHint(QPainter::Antialiasing, false);
 }
 
@@ -678,7 +719,7 @@ void CanvasWidget::mousePressEvent(QMouseEvent* event) {
     default:
         if (gas::TiledImage* img = beginEdit()) {
             editImage_ = img;
-            const bool brushLike = tool_ == Tool::Brush || tool_ == Tool::Eraser;
+            const bool brushLike = usesBrushSettings(tool_);
             smoother_.setSmoothing(brushLike ? brushSettings(tool_).smoothing : 0.0);
             const gas::StrokeSample s = smoother_.begin({docAt(event->position()), pressureOf(event)});
             strokeTool()->begin(*img, s.pos, s.pressure);

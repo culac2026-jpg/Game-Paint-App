@@ -8,9 +8,34 @@
 
 namespace gas {
 
+struct EffectCache {
+    std::optional<TiledImage> rendered;
+    std::vector<TiledImage::TilePtr> source, mask; // what `rendered` was built from
+    std::uint64_t sourceRevision = 0, maskRevision = 0;
+    bool hadMask = false;
+    std::vector<Effect> effects;
+};
+
 namespace {
 
 constexpr int kTile = TiledImage::kTileSize;
+
+LayerProps namedProps(std::string name) {
+    LayerProps p;
+    p.name = std::move(name);
+    return p;
+}
+
+int marginTiles(const std::vector<Effect>& effects) { return (effectMargin(effects) + kTile - 1) / kTile; }
+
+// Marks every tile within `reach` tiles of (tx, ty).
+void markAround(std::vector<bool>& marks, int tilesX, int tilesY, int tx, int ty, int reach) {
+    for (int y = std::max(0, ty - reach); y <= std::min(tilesY - 1, ty + reach); ++y) {
+        for (int x = std::max(0, tx - reach); x <= std::min(tilesX - 1, tx + reach); ++x) {
+            marks[static_cast<std::size_t>(y * tilesX + x)] = true;
+        }
+    }
+}
 
 void checkSize(int width, int height) {
     if (width <= 0 || height <= 0 || width > Document::kMaxSize || height > Document::kMaxSize) {
@@ -86,7 +111,7 @@ TiledImage croppedImage(const TiledImage& src, IRect area) {
 
 Document::Document(int width, int height) : width_(width), height_(height), selection_(width, height) {
     checkSize(width, height);
-    layers_.push_back({{nextLayerName()}, TiledImage(width, height), std::nullopt});
+    layers_.emplace_back(namedProps(nextLayerName()), TiledImage(width, height));
     ++createdLayers_;
 }
 
@@ -204,7 +229,7 @@ void Document::addLayer() {
     }
     const int index = activeLayer_ + 1;
     const int prevActive = activeLayer_;
-    Layer layer{{nextLayerName()}, TiledImage(width_, height_), std::nullopt};
+    Layer layer(namedProps(nextLayerName()), TiledImage(width_, height_));
     ++createdLayers_;
     execute({"New Layer",
              [this, index, prevActive] {
@@ -225,6 +250,7 @@ bool Document::duplicateLayer(int index) {
     }
     Layer copy = layers_[static_cast<std::size_t>(index)]; // shares tiles (copy-on-write)
     copy.props.name += " copy";
+    copy.effectCache.reset(); // two live layers sharing one cache would keep rebuilding it
     const int prevActive = activeLayer_;
     const int at = index + 1;
     execute({"Duplicate Layer",
@@ -290,6 +316,9 @@ bool Document::setLayerProps(int index, const LayerProps& props) {
     }
     LayerProps clean = props;
     clean.opacity = std::clamp(clean.opacity, 0.0, 1.0);
+    for (Effect& e : clean.effects) {
+        e = sanitized(e);
+    }
     const LayerProps before = layers_[static_cast<std::size_t>(index)].props;
     if (clean == before) {
         return false;
@@ -392,6 +421,21 @@ bool Document::applyLayerMask(int index) {
     }
     after.mask.reset();
     replaceLayer(index, std::move(after), "Apply Layer Mask");
+    return true;
+}
+
+bool Document::rasterizeLayerEffects(int index) {
+    if (busy() || index < 0 || index >= layerCount() ||
+        !hasActiveEffects(layers_[static_cast<std::size_t>(index)].props.effects)) {
+        return false;
+    }
+    Layer after = layers_[static_cast<std::size_t>(index)];
+    after.image = renderedLayer(index); // shares the rendered tiles
+    after.image.takeDirtyTiles();
+    after.mask.reset();
+    after.props.effects.clear();
+    after.effectCache.reset();
+    replaceLayer(index, std::move(after), "Rasterize Effects");
     return true;
 }
 
@@ -712,7 +756,7 @@ bool Document::crop(IRect area) {
     std::vector<Layer> cropped;
     cropped.reserve(layers_.size());
     for (const Layer& l : layers_) {
-        Layer c{l.props, croppedImage(l.image, area), std::nullopt};
+        Layer c(l.props, croppedImage(l.image, area));
         if (l.mask) {
             c.mask = croppedImage(*l.mask, area);
         }
@@ -739,17 +783,78 @@ bool Document::crop(IRect area) {
 
 // ---------------------------------------------------------------- rendering
 
+const TiledImage& Document::renderedLayer(int index) const {
+    const Layer& l = layers_.at(static_cast<std::size_t>(index));
+    return hasActiveEffects(l.props.effects) ? effectImage(l) : l.image;
+}
+
+const TiledImage& Document::effectImage(const Layer& l) const {
+    if (!l.effectCache) {
+        l.effectCache = std::make_shared<EffectCache>();
+    }
+    EffectCache& c = *l.effectCache;
+    const TiledImage* mask = (l.mask && l.props.maskEnabled) ? &*l.mask : nullptr;
+    const bool full = !c.rendered || c.rendered->width() != l.image.width() ||
+                      c.rendered->height() != l.image.height() || c.effects != l.props.effects ||
+                      c.hadMask != (mask != nullptr);
+    if (!full && c.sourceRevision == l.image.revision() && (!mask || c.maskRevision == mask->revision())) {
+        return *c.rendered;
+    }
+    const int tx = l.image.tilesX(), ty = l.image.tilesY();
+    const int reach = marginTiles(l.props.effects);
+    std::vector<TiledImage::TilePtr> source = l.image.snapshot();
+    std::vector<TiledImage::TilePtr> maskTiles = mask ? mask->snapshot() : std::vector<TiledImage::TilePtr>{};
+    std::vector<bool> marks(static_cast<std::size_t>(tx * ty), false);
+    if (full) {
+        c.rendered.emplace(l.image.width(), l.image.height());
+        for (int y = 0; y < ty; ++y) {
+            for (int x = 0; x < tx; ++x) {
+                if (source[static_cast<std::size_t>(y * tx + x)]) {
+                    markAround(marks, tx, ty, x, y, reach);
+                }
+            }
+        }
+    } else {
+        // Copy-on-write makes any edited tile a new pointer, so a pointer diff finds every change.
+        for (int y = 0; y < ty; ++y) {
+            for (int x = 0; x < tx; ++x) {
+                const auto i = static_cast<std::size_t>(y * tx + x);
+                if (source[i] != c.source[i] || (mask && maskTiles[i] != c.mask[i])) {
+                    markAround(marks, tx, ty, x, y, reach);
+                }
+            }
+        }
+    }
+    for (int y = 0; y < ty; ++y) {
+        for (int x = 0; x < tx; ++x) {
+            if (marks[static_cast<std::size_t>(y * tx + x)]) {
+                renderEffects(l.image, mask, l.props.effects, {x, y, 1, 1}, *c.rendered);
+            }
+        }
+    }
+    c.rendered->takeDirtyTiles();
+    c.source = std::move(source);
+    c.mask = std::move(maskTiles);
+    c.sourceRevision = l.image.revision();
+    c.maskRevision = mask ? mask->revision() : 0;
+    c.hadMask = mask != nullptr;
+    c.effects = l.props.effects;
+    return *c.rendered;
+}
+
 bool Document::compositeTile(int tx, int ty, TiledImage::Tile& out) const {
     bool any = false;
     for (const Layer& l : layers_) {
         if (!l.props.visible || l.props.opacity <= 0.0) {
             continue;
         }
-        const TiledImage::Tile* t = l.image.tile(tx, ty);
+        const bool effects = hasActiveEffects(l.props.effects);
+        const TiledImage::Tile* t = (effects ? effectImage(l) : l.image).tile(tx, ty);
         if (!t) {
             continue;
         }
-        const TiledImage::Tile* m = (l.mask && l.props.maskEnabled) ? l.mask->tile(tx, ty) : nullptr;
+        // With effects the mask is already part of the rendered image.
+        const TiledImage::Tile* m = (!effects && l.mask && l.props.maskEnabled) ? l.mask->tile(tx, ty) : nullptr;
         const bool opaqueLayer = l.props.opacity >= 1.0;
         const BlendMode mode = l.props.blendMode;
         if (!any) {
@@ -793,6 +898,10 @@ Rgba8 Document::compositePixel(Point p) const {
             continue;
         }
         double coverage = l.props.opacity;
+        if (hasActiveEffects(l.props.effects)) {
+            out = blendPixel(out, effectImage(l).pixel(p), l.props.blendMode, coverage);
+            continue;
+        }
         if (l.mask && l.props.maskEnabled) {
             coverage *= maskValue(l.mask->pixel(p)) / 255.0;
         }
@@ -826,12 +935,14 @@ std::vector<Point> Document::takeDirtyTiles() {
     const int tx = tilesX();
     std::vector<bool> seen(static_cast<std::size_t>(tx * tilesY()), false);
     for (Layer& l : layers_) {
+        // Effects reach beyond the edited tiles (outlines, shadows, blur).
+        const int reach = hasActiveEffects(l.props.effects) ? marginTiles(l.props.effects) : 0;
         for (const Point& t : l.image.takeDirtyTiles()) {
-            seen[static_cast<std::size_t>(t.y * tx + t.x)] = true;
+            markAround(seen, tx, tilesY(), t.x, t.y, reach);
         }
         if (l.mask) {
             for (const Point& t : l.mask->takeDirtyTiles()) {
-                seen[static_cast<std::size_t>(t.y * tx + t.x)] = true;
+                markAround(seen, tx, tilesY(), t.x, t.y, reach);
             }
         }
     }

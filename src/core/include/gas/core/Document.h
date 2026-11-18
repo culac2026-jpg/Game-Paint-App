@@ -1,6 +1,7 @@
 #pragma once
 
 #include "gas/core/Blend.h"
+#include "gas/core/Effects.h"
 #include "gas/core/Selection.h"
 #include "gas/core/TiledImage.h"
 #include "gas/core/Transform.h"
@@ -22,16 +23,25 @@ struct LayerProps {
     double opacity = 1.0;    // 0..1
     bool maskEnabled = true; // ignored when the layer has no mask
     BlendMode blendMode = BlendMode::Normal;
+    std::vector<Effect> effects; // non-destructive effect stack (see Effects.h)
 
     friend bool operator==(const LayerProps&, const LayerProps&) = default;
 };
 
+struct EffectCache;
+
 struct Layer {
+    Layer(LayerProps p, TiledImage img, std::optional<TiledImage> m = std::nullopt)
+        : props(std::move(p)), image(std::move(img)), mask(std::move(m)) {}
+
     LayerProps props;
     TiledImage image;
     // Non-destructive layer mask, painted like any image; see maskValue()
     // (unpainted = shown, black = hidden).
     std::optional<TiledImage> mask;
+    // Rendered "pixels + mask + effects", rebuilt lazily by the document. It
+    // validates itself against the content, so copies may share it safely.
+    mutable std::shared_ptr<EffectCache> effectCache;
 };
 
 // A layered raster document with linear undo/redo.
@@ -88,6 +98,8 @@ public:
     bool removeLayerMask(int index);
     // Bakes the mask into the layer's alpha and removes it.
     bool applyLayerMask(int index);
+    // Bakes the layer's effects (and mask) into its pixels and clears them.
+    bool rasterizeLayerEffects(int index);
     // Whether pixel edits target the active layer's mask (a view choice).
     bool editingMask() const;
     void setEditingMask(bool editMask) { editingMask_ = editMask; }
@@ -160,6 +172,9 @@ public:
     // Tiles whose composite changed since the last call.
     std::vector<Point> takeDirtyTiles();
     void markAllDirty() { structureDirty_ = true; }
+    // What layer `index` contributes before opacity/blend: its pixels, or
+    // pixels + mask + effects when it has active effects.
+    const TiledImage& renderedLayer(int index) const;
 
 private:
     struct Command {
@@ -208,6 +223,7 @@ private:
     // Replaces layer `index` wholesale as one undo step.
     void replaceLayer(int index, Layer after, const std::string& label);
     void restoreTiles(TiledImage& image, const std::vector<TiledImage::TilePtr>& from, IRect area);
+    const TiledImage& effectImage(const Layer& layer) const;
 
     int width_;
     int height_;

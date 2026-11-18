@@ -53,5 +53,7 @@ private:
     std::vector<Field> fields_;
     QCheckBox* followDirection_ = nullptr;
     QComboBox* blendMode_ = nullptr;
+    QComboBox* shape_ = nullptr;
+    QLabel* tipPreview_ = nullptr;
     QLabel* hint_ = nullptr;
 };

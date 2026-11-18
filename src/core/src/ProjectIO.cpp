@@ -31,6 +31,7 @@ constexpr std::uint32_t kChunkDoc = fourcc("DOCM");
 constexpr std::uint32_t kChunkLayer = fourcc("LAYR");
 constexpr std::uint32_t kChunkMask = fourcc("LMSK");
 constexpr std::uint32_t kChunkLayerProps = fourcc("LPRP");
+constexpr std::uint32_t kChunkEffects = fourcc("LEFX");
 constexpr std::uint32_t kChunkEnd = fourcc("END ");
 
 std::uint32_t crc32Of(const std::uint8_t* data, std::size_t size) {
@@ -258,6 +259,27 @@ IoResult saveProject(const Document& doc, const fs::path& path) {
             pw.u8(static_cast<std::uint8_t>(layer.props.blendMode));
             w.chunk(kChunkLayerProps, pw);
         }
+        if (!layer.props.effects.empty()) {
+            ByteWriter ew;
+            ew.u32(static_cast<std::uint32_t>(i));
+            ew.u16(static_cast<std::uint16_t>(std::min<std::size_t>(layer.props.effects.size(), 0xFFFF)));
+            for (std::size_t k = 0; k < layer.props.effects.size() && k < 0xFFFF; ++k) {
+                const Effect& e = layer.props.effects[k];
+                ew.u8(static_cast<std::uint8_t>(e.type));
+                ew.u8(static_cast<std::uint8_t>((e.enabled ? 1 : 0) | (e.smooth ? 2 : 0)));
+                ew.u8(e.color.r);
+                ew.u8(e.color.g);
+                ew.u8(e.color.b);
+                ew.u8(e.color.a);
+                const double values[] = {e.opacity, e.size,       e.offsetX,   e.offsetY,
+                                         e.hue,     e.saturation, e.lightness, e.contrast};
+                ew.u16(static_cast<std::uint16_t>(std::size(values)));
+                for (double v : values) {
+                    ew.f32(static_cast<float>(v));
+                }
+            }
+            w.chunk(kChunkEffects, ew);
+        }
     }
     w.chunk(kChunkEnd, ByteWriter{});
     w.u32(crc32Of(w.bytes.data(), w.bytes.size()));
@@ -330,7 +352,7 @@ LoadResult loadProject(const fs::path& path) {
             if (!haveHeader || layers.size() >= expectedLayers) {
                 return fail("Unexpected layer data");
             }
-            Layer layer{{}, TiledImage(width, height), std::nullopt};
+            Layer layer(LayerProps{}, TiledImage(width, height));
             const std::uint16_t nameLength = c.u16();
             const std::uint8_t* name = c.bytes(nameLength);
             const std::uint8_t flags = c.u8();
@@ -365,6 +387,42 @@ LoadResult loadProject(const fs::path& path) {
                 return fail("Invalid layer properties");
             }
             layers[index].props.blendMode = mode < kBlendModeCount ? static_cast<BlendMode>(mode) : BlendMode::Normal;
+        } else if (tag == kChunkEffects) {
+            const std::uint32_t index = c.u32();
+            const std::uint16_t count = c.u16();
+            if (!c.ok() || index >= layers.size()) {
+                return fail("Invalid layer effects");
+            }
+            std::vector<Effect> effects;
+            for (std::uint16_t k = 0; k < count; ++k) {
+                Effect e;
+                const std::uint8_t type = c.u8();
+                const std::uint8_t flags = c.u8();
+                e.color.r = c.u8();
+                e.color.g = c.u8();
+                e.color.b = c.u8();
+                e.color.a = c.u8();
+                const std::uint16_t floats = c.u16();
+                double* fields[] = {&e.opacity, &e.size,       &e.offsetX,   &e.offsetY,
+                                    &e.hue,     &e.saturation, &e.lightness, &e.contrast};
+                for (std::uint16_t f = 0; f < floats; ++f) {
+                    const float v = c.f32();
+                    if (f < std::size(fields)) {
+                        *fields[f] = v;
+                    }
+                }
+                if (!c.ok()) {
+                    return fail("Invalid layer effects");
+                }
+                if (type >= kEffectTypeCount) {
+                    continue; // written by a newer version
+                }
+                e.type = static_cast<EffectType>(type);
+                e.enabled = (flags & 1) != 0;
+                e.smooth = (flags & 2) != 0;
+                effects.push_back(sanitized(e));
+            }
+            layers[index].props.effects = std::move(effects);
         } else if (tag == kChunkEnd) {
             haveEnd = true;
         }

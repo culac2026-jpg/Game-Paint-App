@@ -33,6 +33,7 @@ LayersPanel::LayersPanel(QWidget* parent) : QWidget(parent) {
     list_->setEditTriggers(QAbstractItemView::DoubleClicked);
     // Keyboard focus would turn single-key tool shortcuts into item searches.
     list_->setFocusPolicy(Qt::NoFocus);
+    list_->setMinimumHeight(130); // ~4 rows even when the docks below are tall
 
     opacity_ = new QSpinBox(this);
     opacity_->setRange(0, 100);

@@ -1,6 +1,7 @@
 #include "MainWindow.h"
 
 #include "BrushPanel.h"
+#include "EffectsPanel.h"
 #include "LayersPanel.h"
 
 #include <gas/core/Document.h>
@@ -17,6 +18,7 @@
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QFormLayout>
+#include <QInputDialog>
 #include <QLabel>
 #include <QMenuBar>
 #include <QMessageBox>
@@ -27,6 +29,7 @@
 #include <QSpinBox>
 #include <QStatusBar>
 #include <QToolBar>
+#include <QTimer>
 #include <QToolButton>
 
 #include <cmath>
@@ -52,6 +55,8 @@ constexpr ToolInfo kTools[] = {
     {Tool::EllipseSelect, QT_TRANSLATE_NOOP("MainWindow", "Ellipse Select"), Qt::Key_O},
     {Tool::Lasso, QT_TRANSLATE_NOOP("MainWindow", "Lasso"), Qt::Key_L},
     {Tool::Move, QT_TRANSLATE_NOOP("MainWindow", "Move"), Qt::Key_V},
+    {Tool::Smudge, QT_TRANSLATE_NOOP("MainWindow", "Smudge"), Qt::Key_S},
+    {Tool::Blur, QT_TRANSLATE_NOOP("MainWindow", "Blur"), Qt::Key_R},
 };
 
 QColor toQColor(gas::Rgba8 c) { return QColor(c.r, c.g, c.b, c.a); }
@@ -121,6 +126,7 @@ MainWindow::~MainWindow() {
     // Views hold raw pointers into the document; detach them first.
     canvas_->setDocument(nullptr);
     layersPanel_->setDocument(nullptr);
+    effectsPanel_->setDocument(nullptr);
 }
 
 void MainWindow::createActions() {
@@ -146,6 +152,7 @@ void MainWindow::createActions() {
     documentActions_ << edit->addAction(tr("&Fill with Foreground"), QKeySequence(Qt::ALT | Qt::Key_Backspace),
                                         this,
                                         [this] { runCommand(document_->fillSelected(canvas_->foregroundColor())); });
+    documentActions_ << edit->addAction(tr("Define &Brush Tip"), this, &MainWindow::defineBrushTip);
     edit->addSeparator();
     documentActions_ << edit->addAction(tr("Free &Transform"), QKeySequence(Qt::CTRL | Qt::Key_T), this,
                                         [this] { canvas_->beginFreeTransform(); });
@@ -165,6 +172,8 @@ void MainWindow::createActions() {
                                           [this] { runCommand(document_->deselect()); });
     documentActions_ << select->addAction(tr("&Inverse"), QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_I), this,
                                           [this] { runCommand(document_->invertSelection()); });
+    documentActions_ << select->addAction(tr("&Feather..."), QKeySequence(Qt::SHIFT | Qt::Key_F6), this,
+                                          &MainWindow::featherSelection);
 
     QMenu* image = menuBar()->addMenu(tr("&Image"));
     documentActions_ << image->addAction(tr("&Crop to Selection"), this, &MainWindow::cropToSelection);
@@ -195,6 +204,7 @@ void MainWindow::createToolBars() {
         a->setToolTip(QStringLiteral("%1 (%2)").arg(a->text(), a->shortcut().toString()));
         a->setChecked(info.tool == canvas_->tool());
         const Tool tool = info.tool;
+        toolActions_.insert(static_cast<int>(tool), a);
         connect(a, &QAction::triggered, this, [this, tool] { selectTool(tool); });
         palette->addAction(a);
         toolsMenu->addAction(a);
@@ -231,6 +241,7 @@ void MainWindow::createToolBars() {
     };
     brushOptionActions_ << addLabeled(tr("Size"), sizeBox_) << addLabeled(tr("Opacity"), opacityBox_)
                         << addLabeled(tr("Hardness"), hardnessBox_);
+    opacityLabel_ = qobject_cast<QLabel*>(options->widgetForAction(brushOptionActions_[2]));
     fillOptionActions_ = addLabeled(tr("Tolerance"), toleranceBox_);
 
     selectionModeBox_ = new QComboBox(options);
@@ -278,13 +289,19 @@ void MainWindow::createToolBars() {
 
 void MainWindow::selectTool(Tool tool) {
     canvas_->setTool(tool);
+    if (QAction* a = toolActions_.value(static_cast<int>(tool))) {
+        a->setChecked(true); // keeps the palette in sync when the tool changes programmatically
+    }
     syncToolOptions();
 }
 
 void MainWindow::syncToolOptions() {
     const Tool tool = canvas_->tool();
     const bool transforming = canvas_->isTransforming();
-    const bool isBrush = tool == Tool::Brush || tool == Tool::Eraser;
+    const bool isBrush = usesBrushSettings(tool);
+    const bool retouch = tool == Tool::Smudge || tool == Tool::Blur;
+    opacityLabel_->setText(retouch ? tr(" Strength ") : tr(" Opacity "));
+    opacityBox_->setToolTip(retouch ? tr("Strength") : tr("Opacity"));
     const bool isSelect = tool == Tool::RectSelect || tool == Tool::EllipseSelect || tool == Tool::Lasso;
     for (QAction* a : brushOptionActions_) {
         a->setVisible(isBrush && !transforming);
@@ -322,7 +339,7 @@ void MainWindow::syncToolOptions() {
 
 void MainWindow::adjustBrushSize(double factor) {
     const Tool tool = canvas_->tool();
-    if (tool != Tool::Brush && tool != Tool::Eraser) {
+    if (!usesBrushSettings(tool)) {
         return;
     }
     const int current = sizeBox_->value();
@@ -381,7 +398,17 @@ void MainWindow::createDocks() {
     brushScroll->setFrameShape(QFrame::NoFrame);
     brushDock->setWidget(brushScroll);
     addDockWidget(Qt::RightDockWidgetArea, brushDock);
-    resizeDocks({dock, brushDock}, {420, 300}, Qt::Vertical); // keep the layer list roomy
+    effectsPanel_ = new EffectsPanel(this);
+    auto* effectsDock = new QDockWidget(tr("Effects"), this);
+    effectsDock->setObjectName(QStringLiteral("effectsDock"));
+    effectsDock->setFeatures(QDockWidget::DockWidgetMovable | QDockWidget::DockWidgetFloatable);
+    effectsDock->setWidget(effectsPanel_);
+    tabifyDockWidget(brushDock, effectsDock);
+    brushDock->raise();
+    connect(effectsPanel_, &EffectsPanel::documentChanged, this, &MainWindow::onDocumentChanged,
+            Qt::QueuedConnection);
+    // Once laid out, give the layer list most of the height (sizes set before show() don't stick).
+    QTimer::singleShot(0, this, [this, dock, brushDock] { resizeDocks({dock, brushDock}, {420, 300}, Qt::Vertical); });
     connect(brushPanel_, &BrushPanel::settingsChanged, this, [this] {
         syncToolOptions(); // a preset may change size / opacity / hardness
         canvas_->update(); // brush outline
@@ -396,6 +423,7 @@ void MainWindow::setDocument(std::unique_ptr<gas::Document> document, const QStr
     // Point the views at the new document before the old one is destroyed.
     canvas_->setDocument(document.get());
     layersPanel_->setDocument(document.get());
+    effectsPanel_->setDocument(document.get());
     document_ = std::move(document);
     filePath_ = path;
     onDocumentChanged();
@@ -420,6 +448,8 @@ void MainWindow::onDocumentChanged() {
     }
     layersPanel_->setEnabled(!transforming);
     layersPanel_->refresh();
+    effectsPanel_->setEnabled(!transforming);
+    effectsPanel_->refresh();
     canvas_->update();
 }
 
@@ -433,6 +463,40 @@ void MainWindow::runCommand(bool changed) {
     if (changed) {
         onDocumentChanged();
     }
+}
+
+void MainWindow::featherSelection() {
+    settleCanvas();
+    if (document_->selection().isEmpty()) {
+        statusBar()->showMessage(tr("Feather needs a selection"), 3000);
+        return;
+    }
+    bool ok = false;
+    const double radius =
+        QInputDialog::getDouble(this, tr("Feather Selection"), tr("Feather radius (px):"), 6.0, 0.5, 250.0, 1, &ok);
+    if (ok) {
+        runCommand(document_->setSelection(document_->selection().feathered(radius), "Feather"));
+    }
+}
+
+// The active layer's pixels under the selection (or the whole layer) become
+// the Brush tool's custom tip.
+void MainWindow::defineBrushTip() {
+    const gas::Selection& sel = document_->selection();
+    const gas::IRect area = sel.bounds().value_or(gas::IRect{0, 0, document_->width(), document_->height()});
+    gas::BrushTip tip = gas::brushTipFromImage(document_->activeLayer().image, area, sel.isEmpty() ? nullptr : &sel);
+    if (tip.empty()) {
+        statusBar()->showMessage(tr("Nothing painted there to make a brush tip from"), 3000);
+        return;
+    }
+    const int size = std::max(tip.width, tip.height);
+    gas::BrushSettings& s = canvas_->brushSettings(Tool::Brush);
+    s.tip.tip = std::make_shared<const gas::BrushTip>(std::move(tip));
+    s.shape = gas::BrushShape::Custom;
+    s.diameter = std::clamp<double>(size, 1.0, gas::BrushSettings::kMaxDiameter);
+    s.spacing = std::max(s.spacing, 0.25); // stamps read better spaced out
+    selectTool(Tool::Brush);
+    statusBar()->showMessage(tr("Brush tip defined (%1 px)").arg(size), 3000);
 }
 
 void MainWindow::cropToSelection() {

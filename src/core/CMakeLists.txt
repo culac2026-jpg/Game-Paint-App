@@ -3,6 +3,7 @@ add_library(gas_core STATIC
     src/Pencil.cpp
     src/Viewport.cpp
     src/Document.cpp
+    src/Effects.cpp
     src/Blend.cpp
     src/Brush.cpp
     src/BrushPresets.cpp

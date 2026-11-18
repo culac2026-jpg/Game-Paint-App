@@ -19,7 +19,12 @@ namespace gas {
 class Document;
 }
 
-enum class Tool { Pencil, Brush, Eraser, Fill, Eyedropper, RectSelect, EllipseSelect, Lasso, Move };
+enum class Tool { Pencil, Brush, Eraser, Fill, Eyedropper, RectSelect, EllipseSelect, Lasso, Move, Smudge, Blur };
+
+// Tools driven by a gas::BrushTool (size/opacity/hardness, tip, dynamics).
+inline bool usesBrushSettings(Tool t) {
+    return t == Tool::Brush || t == Tool::Eraser || t == Tool::Smudge || t == Tool::Blur;
+}
 
 // Viewport onto a gas::Document: checkerboard, nearest-neighbour tile
 // rendering, wheel zoom around the cursor, middle-drag / Space+drag panning,
@@ -112,6 +117,7 @@ private:
     };
 
     gas::StrokeTool* strokeTool();
+    const gas::BrushTool* brushTool() const;
     gas::TiledImage* beginEdit();
     void finishStroke();
     void finishSelectionDrag(bool shift, bool alt);
@@ -149,6 +155,8 @@ private:
     gas::PencilTool pencil_;
     gas::BrushTool brush_{gas::BrushMode::Paint};
     gas::BrushTool eraser_{gas::BrushMode::Erase};
+    gas::BrushTool smudge_{gas::BrushMode::Smudge};
+    gas::BrushTool blur_{gas::BrushMode::Blur};
     int fillTolerance_ = 0;
     bool picking_ = false;
     gas::StrokeSmoother smoother_;

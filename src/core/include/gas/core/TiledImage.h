@@ -4,6 +4,7 @@
 #include "gas/core/Geometry.h"
 
 #include <array>
+#include <cstdint>
 #include <memory>
 #include <vector>
 
@@ -64,6 +65,10 @@ public:
     // Returns tiles written since the last call (tile coordinates), and clears the set.
     std::vector<Point> takeDirtyTiles();
 
+    // Changes on every write; unique across all images (copies share it until
+    // one of them is written), so caches can key on it.
+    std::uint64_t revision() const { return revision_; }
+
 private:
     int tileIndex(int tx, int ty) const { return ty * tilesX_ + tx; }
     void markDirty(int tx, int ty);
@@ -75,6 +80,7 @@ private:
     std::vector<std::shared_ptr<Tile>> tiles_;
     std::vector<bool> dirtyFlags_;
     std::vector<Point> dirtyList_;
+    std::uint64_t revision_;
 };
 
 } // namespace gas

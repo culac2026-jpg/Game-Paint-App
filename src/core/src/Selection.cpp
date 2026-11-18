@@ -486,4 +486,66 @@ bool operator==(const Selection& a, const Selection& b) {
     return true;
 }
 
+Selection Selection::feathered(double radius) const {
+    const std::optional<IRect> b = bounds();
+    if (!b || radius <= 0.0) {
+        return *this;
+    }
+    // Three box passes of radius k approximate a Gaussian with sigma ~ k.
+    const int k = std::max(1, static_cast<int>(std::lround(radius / 2.0)));
+    const int margin = 3 * k + 1;
+    const IRect area =
+        IRect{b->x - margin, b->y - margin, b->w + 2 * margin, b->h + 2 * margin}.intersected({0, 0, width_, height_});
+    const auto n = static_cast<std::size_t>(area.w) * static_cast<std::size_t>(area.h);
+    std::vector<float> buf(n), tmp(n);
+    for (int y = 0; y < area.h; ++y) {
+        for (int x = 0; x < area.w; ++x) {
+            buf[static_cast<std::size_t>(y * area.w + x)] = coverage({area.x + x, area.y + y});
+        }
+    }
+    // Sliding-window box average along a line (outside = unselected).
+    const auto box = [k](const float* in, float* out, int len, int stride) {
+        double sum = 0.0;
+        for (int i = 0; i <= k && i < len; ++i) {
+            sum += in[i * stride];
+        }
+        const double inv = 1.0 / (2 * k + 1);
+        for (int i = 0; i < len; ++i) {
+            out[i * stride] = static_cast<float>(sum * inv);
+            if (i + k + 1 < len) {
+                sum += in[(i + k + 1) * stride];
+            }
+            if (i - k >= 0) {
+                sum -= in[(i - k) * stride];
+            }
+        }
+    };
+    for (int pass = 0; pass < 3; ++pass) {
+        for (int y = 0; y < area.h; ++y) {
+            box(&buf[static_cast<std::size_t>(y * area.w)], &tmp[static_cast<std::size_t>(y * area.w)], area.w, 1);
+        }
+        for (int x = 0; x < area.w; ++x) {
+            box(&tmp[static_cast<std::size_t>(x)], &buf[static_cast<std::size_t>(x)], area.h, area.w);
+        }
+    }
+    Selection out(width_, height_);
+    for (int ty = area.y / kTile; ty <= (area.y + area.h - 1) / kTile; ++ty) {
+        for (int tx = area.x / kTile; tx <= (area.x + area.w - 1) / kTile; ++tx) {
+            auto tile = std::make_shared<MaskTile>();
+            tile->fill(0);
+            const int x0 = std::max(area.x, tx * kTile), x1 = std::min(area.x + area.w, (tx + 1) * kTile);
+            const int y0 = std::max(area.y, ty * kTile), y1 = std::min(area.y + area.h, (ty + 1) * kTile);
+            for (int y = y0; y < y1; ++y) {
+                for (int x = x0; x < x1; ++x) {
+                    const float v = buf[static_cast<std::size_t>((y - area.y) * area.w + (x - area.x))];
+                    (*tile)[static_cast<std::size_t>((y - ty * kTile) * kTile + (x - tx * kTile))] =
+                        static_cast<std::uint8_t>(std::lround(std::clamp(v, 0.0f, 255.0f)));
+                }
+            }
+            out.store(tx, ty, std::move(tile));
+        }
+    }
+    return out;
+}
+
 } // namespace gas

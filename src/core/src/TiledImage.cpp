@@ -1,5 +1,6 @@
 #include "gas/core/TiledImage.h"
 
+#include <atomic>
 #include <stdexcept>
 #include <utility>
 
@@ -7,10 +8,15 @@ namespace gas {
 
 namespace {
 int ceilDiv(int a, int b) { return (a + b - 1) / b; }
+
+std::uint64_t nextRevision() {
+    static std::atomic<std::uint64_t> counter{0};
+    return ++counter;
+}
 } // namespace
 
 TiledImage::TiledImage(int width, int height)
-    : width_(width), height_(height) {
+    : width_(width), height_(height), revision_(nextRevision()) {
     if (width <= 0 || height <= 0) {
         throw std::invalid_argument("TiledImage dimensions must be positive");
     }
@@ -41,6 +47,7 @@ void TiledImage::setPixel(Point p, Rgba8 color) {
 }
 
 void TiledImage::markDirty(int tx, int ty) {
+    revision_ = nextRevision();
     const auto index = static_cast<std::size_t>(tileIndex(tx, ty));
     if (!dirtyFlags_[index]) {
         dirtyFlags_[index] = true;
