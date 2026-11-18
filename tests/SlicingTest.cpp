@@ -94,7 +94,7 @@ TEST(Slicing, NamesAreNumberedAndUnique) {
 
 TEST(DocumentSlices, UndoRedoClipAndMerge) {
     Document doc(100, 80);
-    EXPECT_TRUE(doc.setSlices({{"a", {90, 70, 20, 20}, {0.5, 0.5}}, {"gone", {200, 200, 5, 5}, {0, 0}}}));
+    EXPECT_TRUE(doc.setSlices({{"a", {90, 70, 20, 20}, {0.5, 0.5}, {}}, {"gone", {200, 200, 5, 5}, {0, 0}, {}}}));
     ASSERT_EQ(doc.slices().size(), 1u);
     EXPECT_EQ(doc.slices()[0].rect, (IRect{90, 70, 10, 10})); // clipped to the canvas
     EXPECT_FALSE(doc.setSlices(doc.slices()));               // no change, no step
@@ -118,7 +118,7 @@ TEST(DocumentSlices, UndoRedoClipAndMerge) {
 
 TEST(DocumentSlices, CropMovesSlices) {
     Document doc(100, 100);
-    doc.setSlices({{"in", {20, 20, 10, 10}, {0.5, 1}}, {"edge", {5, 5, 20, 20}, {0, 0}}, {"out", {0, 0, 5, 5}, {0, 0}}});
+    doc.setSlices({{"in", {20, 20, 10, 10}, {0.5, 1}, {}}, {"edge", {5, 5, 20, 20}, {0, 0}, {}}, {"out", {0, 0, 5, 5}, {0, 0}, {}}});
     ASSERT_TRUE(doc.crop({10, 10, 50, 50}));
     ASSERT_EQ(doc.slices().size(), 2u);
     EXPECT_EQ(doc.slices()[0].rect, (IRect{10, 10, 10, 10}));
@@ -132,7 +132,7 @@ TEST(DocumentSlices, SurviveSaveAndOpen) {
     const auto path = std::filesystem::temp_directory_path() / "gas_slices_test.gas";
     {
         Document doc(64, 32);
-        doc.setSlices({{"hero_idle", {0, 0, 32, 32}, {0.5, 1.0}}, {"Kiếm", {32, 4, 16, 20}, {0.25, -0.5}}});
+        doc.setSlices({{"hero_idle", {0, 0, 32, 32}, {0.5, 1.0}, {}}, {"Kiếm", {32, 4, 16, 20}, {0.25, -0.5}, {}}});
         ASSERT_TRUE(saveProject(doc, path).ok);
     }
     LoadResult r = loadProject(path);

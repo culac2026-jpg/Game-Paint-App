@@ -5,6 +5,7 @@
 #include "LayersPanel.h"
 #include "SlicesPanel.h"
 #include "TimelinePanel.h"
+#include "VectorTools.h"
 
 #include <gas/core/Document.h>
 #include <gas/core/ProjectIO.h>
@@ -42,7 +43,9 @@
 #include <QTimer>
 #include <QToolButton>
 
+#include <algorithm>
 #include <cmath>
+#include <cstring>
 
 namespace {
 
@@ -68,6 +71,9 @@ constexpr ToolInfo kTools[] = {
     {Tool::Smudge, QT_TRANSLATE_NOOP("MainWindow", "Smudge"), Qt::Key_S},
     {Tool::Blur, QT_TRANSLATE_NOOP("MainWindow", "Blur"), Qt::Key_R},
     {Tool::Slice, QT_TRANSLATE_NOOP("MainWindow", "Slice"), Qt::Key_K},
+    {Tool::Pen, QT_TRANSLATE_NOOP("MainWindow", "Pen"), Qt::Key_P},
+    {Tool::Shape, QT_TRANSLATE_NOOP("MainWindow", "Shape"), Qt::Key_J},
+    {Tool::Node, QT_TRANSLATE_NOOP("MainWindow", "Node"), Qt::Key_A},
 };
 
 QColor toQColor(gas::Rgba8 c) { return QColor(c.r, c.g, c.b, c.a); }
@@ -209,6 +215,7 @@ void MainWindow::createActions() {
     file->addAction(tr("Save &As..."), QKeySequence::SaveAs, this, &MainWindow::saveAs);
     file->addAction(tr("&Export PNG..."), QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_E), this,
                     &MainWindow::exportPng);
+    file->addAction(tr("Export S&VG..."), this, &MainWindow::exportSvg);
     file->addSeparator();
     file->addAction(tr("&Import Images..."), QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_O), this,
                     &MainWindow::importImages);
@@ -230,6 +237,10 @@ void MainWindow::createActions() {
     documentActions_ << edit->addAction(tr("C&lear"), QKeySequence::Delete, this, [this] {
         if (canvas_->tool() == Tool::Slice) {
             canvas_->deleteSelectedSlice(); // Delete removes the selected slice, never pixels
+            return;
+        }
+        if (isVectorTool(canvas_->tool())) {
+            canvas_->vectorEditor()->deleteSelection(); // the selected node or shape
             return;
         }
         runCommand(document_->eraseSelected());
@@ -260,6 +271,21 @@ void MainWindow::createActions() {
     documentActions_ << select->addAction(tr("&Feather..."), QKeySequence(Qt::SHIFT | Qt::Key_F6), this,
                                           &MainWindow::featherSelection);
 
+    QMenu* layerMenu = menuBar()->addMenu(tr("&Layer"));
+    documentActions_ << layerMenu->addAction(tr("New &Vector Layer"), this, [this] {
+        settleCanvas();
+        runCommand(document_->addVectorLayer());
+    });
+    documentActions_ << layerMenu->addAction(tr("&Rasterize Vector Layer"), this, [this] {
+        settleCanvas();
+        runCommand(document_->rasterizeVectorLayer(document_->activeLayerIndex()));
+    });
+    layerMenu->addSeparator();
+    documentActions_ << layerMenu->addAction(tr("Bring Shape &Forward"), QKeySequence(Qt::CTRL | Qt::Key_BracketRight),
+                                             this, [this] { canvas_->vectorEditor()->raiseSelection(1); });
+    documentActions_ << layerMenu->addAction(tr("Send Shape &Backward"), QKeySequence(Qt::CTRL | Qt::Key_BracketLeft),
+                                             this, [this] { canvas_->vectorEditor()->raiseSelection(-1); });
+
     QMenu* image = menuBar()->addMenu(tr("&Image"));
     documentActions_ << image->addAction(tr("&Crop to Selection"), this, &MainWindow::cropToSelection);
     image->addSeparator();
@@ -278,7 +304,7 @@ void MainWindow::createActions() {
                     [this] { runFrameCommand(&TimelinePanel::previousFrame); });
     anim->addAction(tr("Ne&xt Frame"), QKeySequence(Qt::Key_Period), this,
                     [this] { runFrameCommand(&TimelinePanel::nextFrame); });
-    anim->addAction(tr("P&lay / Stop"), QKeySequence(Qt::Key_P), this,
+    anim->addAction(tr("P&lay / Stop"), QKeySequence(Qt::ALT | Qt::Key_P), this,
                     [this] { timelinePanel_->togglePlay(); });
     anim->addSeparator();
     onionAction_ = anim->addAction(tr("&Onion Skin"));
@@ -416,6 +442,9 @@ void MainWindow::createToolBars() {
     });
     connect(antialiasBox_, &QCheckBox::toggled, this, [this](bool on) { canvas_->setAntialiasSelection(on); });
 
+    vectorOptions_ = new VectorOptions(canvas_->vectorEditor(), options);
+    vectorOptionsAction_ = options->addWidget(vectorOptions_);
+
     interpolationBox_ = new QComboBox(options);
     interpolationBox_->addItem(tr("Nearest (pixel art)"), static_cast<int>(gas::Interpolation::Nearest));
     interpolationBox_->addItem(tr("Bilinear (smooth)"), static_cast<int>(gas::Interpolation::Bilinear));
@@ -450,6 +479,19 @@ void MainWindow::selectTool(Tool tool) {
         slicesDock_->raise();
         statusBar()->showMessage(tr("Slice: drag to add a sprite region, drag a box to move it, its handles to resize, "
                                     "the cross to move the pivot (Shift snaps). Arrows nudge, Delete removes."),
+                                 6000);
+    }
+    if (tool == Tool::Pen) {
+        statusBar()->showMessage(tr("Pen: click for corners, drag for curves; click the first node to close, "
+                                    "Enter or double-click to finish, Backspace removes a node, Esc cancels."),
+                                 6000);
+    } else if (tool == Tool::Shape) {
+        statusBar()->showMessage(tr("Shape: drag a box (Shift = square, Alt = from the centre). Pick the shape, fill "
+                                    "and stroke on the options bar."),
+                                 6000);
+    } else if (tool == Tool::Node) {
+        statusBar()->showMessage(tr("Node: click a shape to select and drag it; drag nodes and handles; Alt+click a "
+                                    "node = corner/smooth; double-click the outline adds a node; Delete removes."),
                                  6000);
     }
     if (QAction* a = toolActions_.value(static_cast<int>(tool))) {
@@ -490,6 +532,8 @@ void MainWindow::syncToolOptions() {
     for (QAction* a : transformApplyActions_) {
         a->setVisible(transforming);
     }
+    vectorOptionsAction_->setVisible(isVectorTool(tool) && !transforming);
+    vectorOptions_->setTool(tool);
     {
         const QSignalBlocker b5(antialiasBox_);
         antialiasBox_->setChecked(canvas_->antialiasSelection());
@@ -587,6 +631,7 @@ void MainWindow::createDocks() {
     connect(slicesPanel_, &SlicesPanel::autoSliceRequested, this, &MainWindow::autoSlice);
     connect(slicesPanel_, &SlicesPanel::gridSliceRequested, this, &MainWindow::gridSlice);
     connect(slicesPanel_, &SlicesPanel::exportAtlasRequested, this, &MainWindow::exportAtlas);
+    connect(slicesPanel_, &SlicesPanel::nineSlicePreviewRequested, this, &MainWindow::nineSlicePreview);
 
     timelinePanel_ = new TimelinePanel(canvas_, this);
     auto* timelineDock = new QDockWidget(tr("Timeline"), this);
@@ -647,6 +692,7 @@ void MainWindow::onDocumentChanged() {
     for (QAction* a : documentActions_) {
         a->setEnabled(!transforming);
     }
+    canvas_->vectorEditor()->documentChanged();
     layersPanel_->setEnabled(!transforming);
     layersPanel_->refresh();
     effectsPanel_->setEnabled(!transforming);
@@ -945,7 +991,7 @@ void MainWindow::importImageFiles(const QStringList& paths) {
         blitImage(sheet, images[i], cx + (cellW - images[i].width()) / 2, cy + cellH - images[i].height());
         const std::string name = gas::uniqueName(names[i].toStdString(), taken);
         taken.push_back(name);
-        slices.push_back({name, {cx, cy, cellW, cellH}, pivot});
+        slices.push_back({name, {cx, cy, cellW, cellH}, pivot, {}});
     }
     std::vector<gas::Layer> layers;
     layers.emplace_back(layerNamed(tr("Sprites")), std::move(sheet));
@@ -1382,4 +1428,124 @@ void MainWindow::exportFrames() {
         return;
     }
     statusBar()->showMessage(tr("Exported %1 frames to %2").arg(written.size()).arg(QDir::toNativeSeparators(exportDir_)), 6000);
+}
+
+void MainWindow::exportSvg() {
+    settleCanvas();
+    QString suggested = filePath_.isEmpty() ? tr("Untitled.svg") : filePath_;
+    if (suggested.endsWith(QLatin1String(gas::kProjectExtension), Qt::CaseInsensitive)) {
+        suggested.chop(static_cast<int>(std::char_traits<char>::length(gas::kProjectExtension)));
+        suggested += QStringLiteral(".svg");
+    }
+    QString path = QFileDialog::getSaveFileName(this, tr("Export SVG"), suggested, tr("SVG image (*.svg)"));
+    if (path.isEmpty()) {
+        return;
+    }
+    if (!path.endsWith(QStringLiteral(".svg"), Qt::CaseInsensitive)) {
+        path += QStringLiteral(".svg");
+    }
+    const gas::IoResult result = gas::exportSvg(*document_, toFsPath(path));
+    if (!result.ok) {
+        QMessageBox::warning(this, tr("Export Failed"),
+                             tr("Could not export \"%1\":\n%2")
+                                 .arg(QFileInfo(path).fileName(), QString::fromStdString(result.error)));
+        return;
+    }
+    statusBar()->showMessage(tr("Exported %1 (vector layers as paths, raster layers as images)")
+                                 .arg(QFileInfo(path).fileName()),
+                             5000);
+}
+
+void MainWindow::nineSlicePreview() {
+    const int index = canvas_->selectedSlice();
+    if (index < 0 || index >= static_cast<int>(document_->slices().size())) {
+        return;
+    }
+    const gas::Slice slice = document_->slices()[static_cast<std::size_t>(index)];
+    const std::vector<gas::Rgba8> pixels = gas::copyPixels(document_->flattenedImage(), slice.rect);
+    static int lastW = 0, lastH = 0, lastZoom = 0; // 0 = fit the preview area
+    static bool lastTile = false;
+
+    QDialog d(this);
+    d.setWindowTitle(tr("9-Slice Preview: %1").arg(QString::fromStdString(slice.name)));
+    auto* width = new QSpinBox(&d);
+    auto* height = new QSpinBox(&d);
+    for (QSpinBox* b : {width, height}) {
+        b->setRange(1, 2048);
+        b->setSuffix(tr(" px"));
+    }
+    width->setValue(lastW > 0 ? lastW : slice.rect.w * 3);
+    height->setValue(lastH > 0 ? lastH : slice.rect.h * 2);
+    auto* zoom = new QSpinBox(&d);
+    zoom->setRange(1, 16);
+    zoom->setPrefix(QStringLiteral("×"));
+    zoom->setValue(lastZoom > 0 ? lastZoom
+                                : std::clamp(560 / std::max(width->value(), height->value()), 1, 8));
+    auto* tile = new QCheckBox(tr("Tile edges and centre"), &d);
+    tile->setChecked(lastTile);
+    auto* view = new QLabel(&d);
+    view->setAlignment(Qt::AlignCenter);
+    auto* scroll = new QScrollArea(&d);
+    scroll->setWidget(view);
+    scroll->setWidgetResizable(true);
+    scroll->setMinimumSize(480, 320);
+    scroll->setBackgroundRole(QPalette::Dark);
+    auto* controls = new QHBoxLayout;
+    controls->addWidget(new QLabel(tr("Size"), &d));
+    controls->addWidget(width);
+    controls->addWidget(new QLabel(QStringLiteral("×"), &d));
+    controls->addWidget(height);
+    controls->addSpacing(12);
+    controls->addWidget(new QLabel(tr("Zoom"), &d));
+    controls->addWidget(zoom);
+    controls->addSpacing(12);
+    controls->addWidget(tile);
+    controls->addStretch(1);
+    auto* note = new QLabel(slice.border.empty()
+                                ? tr("This slice has no 9-slice border yet: it simply stretches.")
+                                : tr("Border L %1, T %2, R %3, B %4 px")
+                                      .arg(slice.border.left)
+                                      .arg(slice.border.top)
+                                      .arg(slice.border.right)
+                                      .arg(slice.border.bottom),
+                            &d);
+    auto* buttons = new QDialogButtonBox(QDialogButtonBox::Close, &d);
+    QObject::connect(buttons, &QDialogButtonBox::rejected, &d, &QDialog::reject);
+    auto* layout = new QVBoxLayout(&d);
+    layout->addLayout(controls);
+    layout->addWidget(scroll, 1);
+    layout->addWidget(note);
+    layout->addWidget(buttons);
+
+    const auto render = [&] {
+        const int w = width->value(), h = height->value(), z = zoom->value();
+        const std::vector<gas::Rgba8> out =
+            gas::nineSliceScale(pixels, slice.rect.w, slice.rect.h, slice.border, w, h, tile->isChecked());
+        QImage img(w, h, QImage::Format_RGBA8888);
+        for (int y = 0; y < h; ++y) {
+            std::memcpy(img.scanLine(y), out.data() + static_cast<std::size_t>(y) * static_cast<std::size_t>(w),
+                        static_cast<std::size_t>(w) * sizeof(gas::Rgba8));
+        }
+        // On a checkerboard, nearest-neighbour zoom like the canvas.
+        QPixmap pm(w * z, h * z);
+        QPainter p(&pm);
+        for (int y = 0; y < pm.height(); y += 8) {
+            for (int x = 0; x < pm.width(); x += 8) {
+                p.fillRect(x, y, 8, 8, ((x + y) / 8) % 2 ? QColor(0x99, 0x99, 0x99) : QColor(0xcc, 0xcc, 0xcc));
+            }
+        }
+        p.drawImage(QRect(0, 0, w * z, h * z), img);
+        p.end();
+        view->setPixmap(pm);
+    };
+    for (QSpinBox* b : {width, height, zoom}) {
+        QObject::connect(b, &QSpinBox::valueChanged, &d, render);
+    }
+    QObject::connect(tile, &QCheckBox::toggled, &d, render);
+    render();
+    d.exec();
+    lastW = width->value();
+    lastH = height->value();
+    lastZoom = zoom->value();
+    lastTile = tile->isChecked();
 }

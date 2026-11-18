@@ -41,6 +41,14 @@ class Document;
 //            u32 layerIndex, u32 frame, TILES
 //     "TAGS" (version 6+) optional: u32 tagCount, then per tag: u16 nameLength,
 //            UTF-8 name, u32 from, u32 to, u8 direction (TagDirection)
+//     "VECT" (version 7+) optional, after its layer (whose LAYR/CELS tiles
+//            are then left out; the shapes are rendered on load): u32 layerIndex,
+//            u32 shapeCount, then per shape: u8 flags (1 = fill, 2 = stroke,
+//            4 = antialias, 8 = closed), u8 join, u8 cap, u8 r, g, b, a (fill),
+//            u8 r, g, b, a (stroke), f64 strokeWidth, u32 nodeCount, then per
+//            node f64 x, y, inX, inY, outX, outY
+//     "SLBD" (version 7+) optional, after SLCS: u32 count, then per slice (in
+//            SLCS order) i32 left, top, right, bottom (9-slice border)
 //     "END "
 //   u32 CRC-32 of every preceding byte
 //
@@ -50,9 +58,9 @@ class Document;
 // Only non-empty tiles are stored. Saves are atomic: written to a temporary
 // sibling file, then renamed over the target, so a failed save never damages
 // an existing file. Undo history and the selection are not saved.
-// Version history: 1 = v0.3 (layers), 2 = v0.4 (layer masks), 3 = v0.5 (blend modes), 4 = v0.6 (layer effects), 5 = v0.7 (slices), 6 = v0.8 (animation frames and tags). Older versions
+// Version history: 1 = v0.3 (layers), 2 = v0.4 (layer masks), 3 = v0.5 (blend modes), 4 = v0.6 (layer effects), 5 = v0.7 (slices), 6 = v0.8 (animation frames and tags), 7 = v0.9 (vector layers, 9-slice borders). Older versions
 // still load; newer ones are refused.
-inline constexpr std::uint32_t kProjectFormatVersion = 6;
+inline constexpr std::uint32_t kProjectFormatVersion = 7;
 inline constexpr const char* kProjectExtension = ".gas";
 
 struct IoResult {
@@ -71,6 +79,12 @@ LoadResult loadProject(const std::filesystem::path& path);
 // Flattened visible layers as an 8-bit RGBA PNG (straight alpha, exact pixels).
 IoResult exportPng(const Document& document, const std::filesystem::path& path);
 std::vector<std::uint8_t> encodePng(int width, int height, const std::vector<Rgba8>& pixels);
+// SVG of the visible layers (bottom to top, with opacity and blend mode):
+// vector layers as editable <path>s, everything else (raster layers, and
+// vector layers with a mask or effects) as embedded PNG images of their
+// rendered content.
+std::string svgDocument(const Document& document);
+IoResult exportSvg(const Document& document, const std::filesystem::path& path);
 
 // Writes via a temporary sibling + rename. Exposed for tests.
 IoResult writeFileAtomic(const std::filesystem::path& path, const std::vector<std::uint8_t>& bytes);

@@ -7,6 +7,8 @@
 #include <QHBoxLayout>
 #include <QLabel>
 #include <QListWidget>
+#include <QPainter>
+#include <QPolygonF>
 #include <QSignalBlocker>
 #include <QSpinBox>
 #include <QToolButton>
@@ -178,6 +180,23 @@ void LayersPanel::refresh() {
         QFont font = item->font();
         font.setItalic(p.locked); // locked layers read differently at a glance
         item->setFont(font);
+        if (layer.vector) {
+            // Vector layers carry a small node-diamond icon.
+            static const QIcon vectorIcon = [] {
+                QPixmap pm(14, 14);
+                pm.fill(Qt::transparent);
+                QPainter painter(&pm);
+                painter.setRenderHint(QPainter::Antialiasing, true);
+                painter.setPen(QPen(QColor(255, 150, 20), 1.5));
+                painter.setBrush(Qt::NoBrush);
+                painter.drawPolygon(QPolygonF({QPointF(7, 1.5), QPointF(12.5, 7), QPointF(7, 12.5), QPointF(1.5, 7)}));
+                painter.setBrush(QColor(255, 150, 20));
+                painter.drawRect(QRectF(5.5, 5.5, 3, 3));
+                return QIcon(pm);
+            }();
+            item->setIcon(vectorIcon);
+            item->setToolTip(tr("Vector layer: edit with the Pen, Shape and Node tools. Double-click to rename."));
+        }
     }
     const int active = document_->activeLayerIndex();
     list_->setCurrentRow(indexToRow(active));

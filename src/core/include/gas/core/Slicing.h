@@ -44,5 +44,11 @@ std::vector<Slice> namedSlices(const std::vector<IRect>& rects, const std::strin
 std::string uniqueName(const std::string& name, const std::vector<std::string>& taken);
 // Row-major copy of `rect` (pixels outside the image are transparent).
 std::vector<Rgba8> copyPixels(const TiledImage& image, IRect rect);
+// 9-slice resize of a w x h sprite to outW x outH (nearest sampling, like a
+// game engine's sliced sprite): corners keep their size (shrunk together when
+// the target is smaller than the borders), edges stretch along their side and
+// the centre both ways; with `tile` edges and centre repeat instead.
+std::vector<Rgba8> nineSliceScale(const std::vector<Rgba8>& src, int w, int h, SliceBorder border, int outW,
+                                  int outH, bool tile = false);
 
 } // namespace gas

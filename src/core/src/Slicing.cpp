@@ -162,7 +162,7 @@ std::vector<Slice> namedSlices(const std::vector<IRect>& rects, const std::strin
     for (std::size_t i = 0; i < rects.size(); ++i) {
         std::string number = std::to_string(firstIndex + static_cast<int>(i));
         number.insert(0, digits - std::min(digits, number.size()), '0');
-        out.push_back({base + "_" + number, rects[i], pivot});
+        out.push_back({base + "_" + number, rects[i], pivot, {}});
     }
     return out;
 }
@@ -191,6 +191,58 @@ std::vector<Rgba8> copyPixels(const TiledImage& image, IRect rect) {
                 out[static_cast<std::size_t>(y - rect.y) * w + static_cast<std::size_t>(x - rect.x)] =
                     t->pixels[static_cast<std::size_t>(TiledImage::pixelIndex(x, y))];
             }
+        }
+    }
+    return out;
+}
+
+namespace {
+
+// Source column (or row) for output position `o` along one axis.
+int nineSliceSource(int o, int out, int size, int a, int b, bool tile) {
+    if (a + b > out && a + b > 0) { // corners only, scaled down together
+        const int ca = static_cast<int>(std::lround(static_cast<double>(a) * out / (a + b)));
+        if (o < ca) {
+            return std::min(a - 1, o * a / std::max(1, ca));
+        }
+        const int cb = std::max(1, out - ca); // mirrored, so both corners keep their outer pixels
+        return size - 1 - std::min(b - 1, (out - 1 - o) * b / cb);
+    }
+    if (o < a) {
+        return o;
+    }
+    if (o >= out - b) {
+        return size - (out - o);
+    }
+    const int mid = size - a - b, outMid = out - a - b;
+    if (mid <= 0) {
+        return std::clamp(a, 0, size - 1);
+    }
+    return a + (tile ? (o - a) % mid : static_cast<int>(static_cast<long long>(o - a) * mid / outMid));
+}
+
+} // namespace
+
+std::vector<Rgba8> nineSliceScale(const std::vector<Rgba8>& src, int w, int h, SliceBorder border, int outW,
+                                  int outH, bool tile) {
+    std::vector<Rgba8> out;
+    if (w <= 0 || h <= 0 || outW <= 0 || outH <= 0 ||
+        src.size() != static_cast<std::size_t>(w) * static_cast<std::size_t>(h)) {
+        return out;
+    }
+    const int left = std::clamp(border.left, 0, w), right = std::clamp(border.right, 0, w - left);
+    const int top = std::clamp(border.top, 0, h), bottom = std::clamp(border.bottom, 0, h - top);
+    std::vector<int> xs(static_cast<std::size_t>(outW));
+    for (int x = 0; x < outW; ++x) {
+        xs[static_cast<std::size_t>(x)] = std::clamp(nineSliceSource(x, outW, w, left, right, tile), 0, w - 1);
+    }
+    out.resize(static_cast<std::size_t>(outW) * static_cast<std::size_t>(outH));
+    for (int y = 0; y < outH; ++y) {
+        const int sy = std::clamp(nineSliceSource(y, outH, h, top, bottom, tile), 0, h - 1);
+        for (int x = 0; x < outW; ++x) {
+            out[static_cast<std::size_t>(y) * static_cast<std::size_t>(outW) + static_cast<std::size_t>(x)] =
+                src[static_cast<std::size_t>(sy) * static_cast<std::size_t>(w) +
+                    static_cast<std::size_t>(xs[static_cast<std::size_t>(x)])];
         }
     }
     return out;

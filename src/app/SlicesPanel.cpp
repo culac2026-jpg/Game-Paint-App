@@ -121,12 +121,32 @@ SlicesPanel::SlicesPanel(CanvasWidget* canvas, QWidget* parent) : QWidget(parent
     pivotRow->setContentsMargins(0, 0, 0, 0);
     pivotRow->addWidget(pivotXBox_);
     pivotRow->addWidget(pivotYBox_);
+    static const char* kBorderTips[4] = {QT_TRANSLATE_NOOP("SlicesPanel", "Left border (px)"),
+                                         QT_TRANSLATE_NOOP("SlicesPanel", "Top border (px)"),
+                                         QT_TRANSLATE_NOOP("SlicesPanel", "Right border (px)"),
+                                         QT_TRANSLATE_NOOP("SlicesPanel", "Bottom border (px)")};
+    auto* borderRow = new QHBoxLayout;
+    borderRow->setContentsMargins(0, 0, 0, 0);
+    for (int k = 0; k < 4; ++k) {
+        borderBoxes_[k] = new QSpinBox(fields_);
+        borderBoxes_[k]->setRange(0, gas::Document::kMaxSize);
+        borderBoxes_[k]->setKeyboardTracking(false);
+        borderBoxes_[k]->setToolTip(tr(kBorderTips[k]));
+        borderRow->addWidget(borderBoxes_[k]);
+    }
+    previewButton_ = new QPushButton(tr("Preview..."), fields_);
+    previewButton_->setToolTip(tr("See the slice stretched like a 9-slice sprite in a game engine"));
     auto* form = new QFormLayout(fields_);
     form->setContentsMargins(0, 0, 0, 0);
     form->addRow(tr("Name"), nameEdit_);
     form->addRow(rectRow);
     form->addRow(tr("Pivot"), pivotBox_);
     form->addRow(QString(), pivotRow);
+    auto* nineLabel = new QLabel(tr("9-slice"), fields_);
+    nineLabel->setToolTip(tr("Borders in pixels (left, top, right, bottom): corners keep their size, edges and centre "
+                             "stretch. With the Slice tool, drag the dashed guides; Alt+drag an edge to add one."));
+    form->addRow(nineLabel, borderRow);
+    form->addRow(QString(), previewButton_);
 
     trimButton_ = new QPushButton(tr("Trim"), this);
     trimButton_->setToolTip(tr("Shrink the selected slice (or every slice if none is selected) to its opaque "
@@ -186,6 +206,15 @@ SlicesPanel::SlicesPanel(CanvasWidget* canvas, QWidget* parent) : QWidget(parent
             editSelected("Slice Pivot", false, [i](gas::Slice& s) { s.pivot = {kPivots[i].x, kPivots[i].y}; });
         }
     });
+    for (int k = 0; k < 4; ++k) {
+        connect(borderBoxes_[k], &QSpinBox::valueChanged, this, [this, k](int v) {
+            editSelected("9-Slice Border", true, [k, v](gas::Slice& s) {
+                int* fields[4] = {&s.border.left, &s.border.top, &s.border.right, &s.border.bottom};
+                *fields[k] = v;
+            });
+        });
+    }
+    connect(previewButton_, &QPushButton::clicked, this, &SlicesPanel::nineSlicePreviewRequested);
     connect(trimButton_, &QPushButton::clicked, this, &SlicesPanel::trim);
     connect(pivotAllButton_, &QPushButton::clicked, this, &SlicesPanel::applyPivotToAll);
     connect(deleteButton_, &QPushButton::clicked, this, [this] {
@@ -207,10 +236,11 @@ void SlicesPanel::refresh() {
     list_->clear();
     if (document_) {
         for (const gas::Slice& s : document_->slices()) {
-            list_->addItem(QStringLiteral("%1   %2×%3")
+            list_->addItem(QStringLiteral("%1   %2×%3%4")
                                .arg(QString::fromStdString(s.name))
                                .arg(s.rect.w)
-                               .arg(s.rect.h));
+                               .arg(s.rect.h)
+                               .arg(s.border.empty() ? QString() : tr("   9-slice")));
         }
         canvas_->setSelectedSlice(canvas_->selectedSlice()); // drops an index that no longer exists
         list_->setCurrentRow(canvas_->selectedSlice());
@@ -233,6 +263,12 @@ void SlicesPanel::syncFields() {
     }
     const gas::Slice& s = document_->slices()[static_cast<std::size_t>(i)];
     const QSignalBlocker b1(nameEdit_), b2(xBox_), b3(yBox_), b4(wBox_), b5(hBox_), b6(pivotXBox_), b7(pivotYBox_);
+    const int borders[4] = {s.border.left, s.border.top, s.border.right, s.border.bottom};
+    for (int k = 0; k < 4; ++k) {
+        const QSignalBlocker block(borderBoxes_[k]);
+        borderBoxes_[k]->setMaximum(k % 2 == 0 ? s.rect.w : s.rect.h);
+        borderBoxes_[k]->setValue(borders[k]);
+    }
     if (!nameEdit_->hasFocus()) {
         nameEdit_->setText(QString::fromStdString(s.name));
     }
@@ -277,8 +313,8 @@ void SlicesPanel::trim() {
         }
         gas::Slice& s = slices[static_cast<std::size_t>(i)];
         const gas::IRect t = gas::trimmedRect(image, s.rect);
-        if (t.empty()) {
-            continue; // nothing painted: leave it alone
+        if (t.empty() || !s.border.empty()) {
+            continue; // nothing painted, or a 9-slice sprite (its borders are measured from the full rect)
         }
         const double px = s.rect.x + s.pivot.x * s.rect.w, py = s.rect.y + s.pivot.y * s.rect.h;
         s.rect = t;

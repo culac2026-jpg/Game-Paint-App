@@ -53,6 +53,7 @@ struct AtlasSprite {
     std::vector<Rgba8> pixels; // row-major, straight alpha
     PointF pivot{0.5, 0.5};    // relative to the sprite, top-left origin
     int duration = 0;          // animation frame time in ms (0 = not a frame)
+    SliceBorder border{};      // 9-slice insets; bordered sprites are never trimmed
 };
 
 struct AtlasFrame {
@@ -65,6 +66,7 @@ struct AtlasFrame {
     PointF pivot;     // relative to the original sprite, top-left origin
     bool trimmed = false;
     int duration = 0;
+    SliceBorder border{}; // 9-slice insets within `frame` (JSON "border", Unity spriteBorder)
 };
 
 struct AtlasPage {

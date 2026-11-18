@@ -1,9 +1,12 @@
 #include "CanvasWidget.h"
 
+#include "VectorTools.h"
+
 #include <gas/core/Document.h>
 #include <gas/core/Fill.h>
 
 #include <QFontMetrics>
+#include <QGuiApplication>
 #include <QKeyEvent>
 #include <QMouseEvent>
 #include <QPainter>
@@ -86,6 +89,9 @@ QString toolLabel(Tool tool) {
     case Tool::Smudge: return CanvasWidget::tr("Smudge");
     case Tool::Blur: return CanvasWidget::tr("Blur");
     case Tool::Slice: return CanvasWidget::tr("Slice");
+    case Tool::Pen: return CanvasWidget::tr("Pen");
+    case Tool::Shape: return CanvasWidget::tr("Shape");
+    case Tool::Node: return CanvasWidget::tr("Node");
     }
     return {};
 }
@@ -106,6 +112,11 @@ CanvasWidget::CanvasWidget(QWidget* parent)
     blur_.settings().hardness = 0.3;
     blur_.settings().spacing = 0.15;
     setForegroundColor(foreground_);
+    vector_ = new VectorEditor(this);
+    connect(vector_, &VectorEditor::edited, this, &CanvasWidget::documentEdited);
+    connect(vector_, &VectorEditor::layerChanged, this, &CanvasWidget::documentEdited);
+    connect(vector_, &VectorEditor::refused, this, &CanvasWidget::editRefused);
+    connect(vector_, &VectorEditor::selectionChanged, this, [this] { update(); });
     updateCursorShape();
 
     antsTimer_.setInterval(150);
@@ -123,8 +134,11 @@ gas::TiledImage* CanvasWidget::beginEdit() {
     gas::TiledImage* img = document_->beginEdit();
     if (!img) {
         const gas::LayerProps& p = document_->activeLayer().props;
-        Q_EMIT editRefused(p.locked ? tr("\"%1\" is locked").arg(QString::fromStdString(p.name))
-                                    : tr("\"%1\" is hidden").arg(QString::fromStdString(p.name)));
+        const QString name = QString::fromStdString(p.name);
+        Q_EMIT editRefused(p.locked    ? tr("\"%1\" is locked").arg(name)
+                           : !p.visible ? tr("\"%1\" is hidden").arg(name)
+                                        : tr("\"%1\" is a vector layer: edit it with the Pen (P), Shape (J) or "
+                                             "Node (A) tool, or use Layer > Rasterize Vector Layer").arg(name));
     }
     return img;
 }
@@ -185,8 +199,13 @@ const gas::BrushTool* CanvasWidget::brushTool() const {
     }
 }
 
+bool CanvasWidget::vectorBusy() const { return vector_ && vector_->busy(); }
+
+QPointF CanvasWidget::docToScreenPoint(gas::PointF doc) const { return toQt(viewport_.docToScreen(doc)); }
+
 void CanvasWidget::setTool(Tool tool) {
     finishStroke();
+    vector_->toolChanged();
     if (transform_ && tool != Tool::Move) {
         commitTransform();
     }
@@ -231,6 +250,7 @@ void CanvasWidget::setDocument(gas::Document* document) {
     dragging_ = false;
     dragPoints_.clear();
     document_ = document;
+    vector_->setDocument(document);
     tileCache_.clear();
     onionCache_.clear();
     outline_.clear();
@@ -371,6 +391,9 @@ void CanvasWidget::paintGL() {
         drawSelection(p);
     }
     drawSlices(p);
+    if (isVectorTool(tool_) && !transform_) {
+        vector_->paint(p, tool_);
+    }
     drawSymmetryGuides(p);
     drawLinePreview(p);
     drawSelectionPreview(p);
@@ -718,6 +741,11 @@ void CanvasWidget::mousePressEvent(QMouseEvent* event) {
         update();
         return;
     }
+    if (isVectorTool(tool_)) {
+        vector_->press(tool_, event->position(), event->modifiers());
+        updateCursorShape();
+        return;
+    }
     switch (tool_) {
     case Tool::Fill:
         if (gas::TiledImage* img = beginEdit()) {
@@ -739,7 +767,7 @@ void CanvasWidget::mousePressEvent(QMouseEvent* event) {
         dragPoints_ = {docAt(event->position()), docAt(event->position())};
         break;
     case Tool::Slice:
-        slicePress(event->position());
+        slicePress(event->position(), event->modifiers());
         break;
     case Tool::Move:
         // Drag the selected pixels (or the whole layer) and commit on release.
@@ -819,6 +847,9 @@ void CanvasWidget::mouseMoveEvent(QMouseEvent* event) {
         } else {
             dragPoints_[1] = doc;
         }
+    } else if (isVectorTool(tool_)) {
+        vector_->move(tool_, event->position(), event->modifiers(), event->buttons() & Qt::LeftButton);
+        updateCursorShape();
     } else if (picking_ && document_) {
         pickColorAt(event->position());
     } else if (sliceDrag_) {
@@ -862,6 +893,11 @@ void CanvasWidget::mouseReleaseEvent(QMouseEvent* event) {
     }
     if (dragging_) {
         finishSelectionDrag(dragMods_.testFlag(Qt::ShiftModifier), dragMods_.testFlag(Qt::AltModifier));
+        return;
+    }
+    if (isVectorTool(tool_)) {
+        vector_->release(tool_, event->position(), event->modifiers());
+        updateCursorShape();
         return;
     }
     picking_ = false;
@@ -1012,6 +1048,11 @@ void CanvasWidget::mouseDoubleClickEvent(QMouseEvent* event) {
             return;
         }
     }
+    if (isVectorTool(tool_) && !transform_ && event->button() == Qt::LeftButton &&
+        vector_->doubleClick(tool_, event->position())) {
+        update();
+        return;
+    }
     mousePressEvent(event);
 }
 
@@ -1029,6 +1070,10 @@ void CanvasWidget::keyPressEvent(QKeyEvent* event) {
     if (event->key() == Qt::Key_Space && !event->isAutoRepeat()) {
         spaceHeld_ = true;
         updateCursorShape();
+        return;
+    }
+    if (isVectorTool(tool_) && !transform_ && vector_->key(tool_, event)) {
+        update();
         return;
     }
     if (transform_) {
@@ -1114,6 +1159,8 @@ void CanvasWidget::updateCursorShape() {
         setCursor(shape);
     } else if (tool_ == Tool::Move) {
         setCursor(Qt::SizeAllCursor);
+    } else if (isVectorTool(tool_)) {
+        setCursor(vector_->cursor(tool_));
     } else if (tool_ == Tool::Slice && document_) {
         Qt::CursorShape shape = Qt::CrossCursor;
         if (sliceDrag_) {
@@ -1124,6 +1171,9 @@ void CanvasWidget::updateCursorShape() {
                 Qt::SizeFDiagCursor, Qt::SizeVerCursor, Qt::SizeBDiagCursor, Qt::SizeHorCursor};
             if (nearSlicePivot(*cursorPos_)) {
                 shape = Qt::PointingHandCursor;
+            } else if (const int b = sliceBorderAt(*cursorPos_, QGuiApplication::keyboardModifiers() & Qt::AltModifier);
+                       b >= 0) {
+                shape = b == 0 || b == 2 ? Qt::SplitHCursor : Qt::SplitVCursor;
             } else if (const int h = sliceHandleAt(*cursorPos_); h >= 0) {
                 shape = kHandleCursors[h];
             } else if (sliceAt(*cursorPos_) >= 0) {
@@ -1241,7 +1291,34 @@ bool CanvasWidget::nearSlicePivot(QPointF pos) const {
     return distance(slicePivotScreen(document_->slices()[static_cast<std::size_t>(selectedSlice_)]), pos) <= 7.0;
 }
 
-void CanvasWidget::slicePress(QPointF pos) {
+int CanvasWidget::sliceBorderAt(QPointF pos, bool alt) const {
+    const std::vector<gas::Slice>& slices = document_->slices();
+    if (selectedSlice_ < 0 || selectedSlice_ >= static_cast<int>(slices.size())) {
+        return -1;
+    }
+    const gas::Slice& s = slices[static_cast<std::size_t>(selectedSlice_)];
+    const QRectF r = sliceScreenRect(s.rect);
+    const double z = viewport_.zoom();
+    // Guide positions in screen space: L, T, R, B.
+    const double guides[4] = {r.left() + s.border.left * z, r.top() + s.border.top * z,
+                              r.right() - s.border.right * z, r.bottom() - s.border.bottom * z};
+    const int values[4] = {s.border.left, s.border.top, s.border.right, s.border.bottom};
+    constexpr double kReach = 4.0;
+    for (int k = 0; k < 4; ++k) {
+        if (values[k] == 0 && !alt) {
+            continue; // an unset guide lies on the edge; Alt+drag pulls it out
+        }
+        const bool vertical = k == 0 || k == 2;
+        const double along = vertical ? pos.y() : pos.x();
+        const double lo = vertical ? r.top() : r.left(), hi = vertical ? r.bottom() : r.right();
+        if (along >= lo && along <= hi && std::abs((vertical ? pos.x() : pos.y()) - guides[k]) <= kReach) {
+            return k;
+        }
+    }
+    return -1;
+}
+
+void CanvasWidget::slicePress(QPointF pos, Qt::KeyboardModifiers mods) {
     const gas::PointF d = docAt(pos);
     const std::vector<gas::Slice>& slices = document_->slices();
     using Mode = SliceDrag::Mode;
@@ -1249,6 +1326,10 @@ void CanvasWidget::slicePress(QPointF pos) {
         const gas::Slice& s = slices[static_cast<std::size_t>(selectedSlice_)];
         if (nearSlicePivot(pos)) {
             sliceDrag_ = SliceDrag{Mode::Pivot, selectedSlice_, -1, d, s, s};
+            return;
+        }
+        if (const int b = sliceBorderAt(pos, mods & Qt::AltModifier); b >= 0) {
+            sliceDrag_ = SliceDrag{Mode::Border, selectedSlice_, b, d, s, s};
             return;
         }
         if (const int h = sliceHandleAt(pos); h >= 0) {
@@ -1313,6 +1394,19 @@ void CanvasWidget::sliceDragTo(QPointF pos, Qt::KeyboardModifiers mods) {
         drag.current.pivot = {(pxAbs - r.x) / r.w, (pyAbs - r.y) / r.h};
         break;
     }
+    case Mode::Border: {
+        // Whole pixels measured from the guide's own edge, never crossing the opposite guide.
+        gas::SliceBorder& b = drag.current.border;
+        const gas::SliceBorder& b0 = drag.start.border;
+        switch (drag.handle) {
+        case 0: b.left = std::clamp(static_cast<int>(std::lround(d.x - r.x)), 0, r.w - b0.right); break;
+        case 1: b.top = std::clamp(static_cast<int>(std::lround(d.y - r.y)), 0, r.h - b0.bottom); break;
+        case 2: b.right = std::clamp(static_cast<int>(std::lround(r.right() - d.x)), 0, r.w - b0.left); break;
+        case 3: b.bottom = std::clamp(static_cast<int>(std::lround(r.bottom() - d.y)), 0, r.h - b0.top); break;
+        default: break;
+        }
+        break;
+    }
     case Mode::Pivot: {
         // Half-pixel steps; Shift snaps each axis to the nearest edge or centre.
         double fx = (std::round(d.x * 2.0) / 2.0 - r.x) / r.w;
@@ -1356,7 +1450,10 @@ void CanvasWidget::finishSliceDrag() {
     } else if (drag.index >= 0 && drag.index < static_cast<int>(slices.size()) &&
                !(drag.current == slices[static_cast<std::size_t>(drag.index)])) {
         slices[static_cast<std::size_t>(drag.index)] = drag.current;
-        const char* label = drag.mode == Mode::Move ? "Move Slice" : drag.mode == Mode::Resize ? "Resize Slice" : "Slice Pivot";
+        const char* label = drag.mode == Mode::Move     ? "Move Slice"
+                            : drag.mode == Mode::Resize ? "Resize Slice"
+                            : drag.mode == Mode::Border ? "9-Slice Border"
+                                                        : "Slice Pivot";
         changed = document_->setSlices(std::move(slices), label);
     }
     if (changed) {
@@ -1421,6 +1518,26 @@ void CanvasWidget::drawSlices(QPainter& p) const {
             p.fillRect(tag, QColor(0, 0, 0, 150));
             p.setPen(colour);
             p.drawText(tag.adjusted(3, 0, 0, 0), Qt::AlignVCenter | Qt::AlignLeft, text);
+        }
+        // 9-slice guides (dashed), inside the box.
+        if (!s.border.empty() && (editing || isSel)) {
+            const double z = viewport_.zoom();
+            QPen guide(QColor(255, 60, 200, isSel ? 230 : 140), 1.0, Qt::DashLine);
+            p.setPen(guide);
+            if (s.border.left > 0) {
+                p.drawLine(QPointF(r.left() + s.border.left * z, r.top()), QPointF(r.left() + s.border.left * z, r.bottom()));
+            }
+            if (s.border.right > 0) {
+                p.drawLine(QPointF(r.right() - s.border.right * z, r.top()),
+                           QPointF(r.right() - s.border.right * z, r.bottom()));
+            }
+            if (s.border.top > 0) {
+                p.drawLine(QPointF(r.left(), r.top() + s.border.top * z), QPointF(r.right(), r.top() + s.border.top * z));
+            }
+            if (s.border.bottom > 0) {
+                p.drawLine(QPointF(r.left(), r.bottom() - s.border.bottom * z),
+                           QPointF(r.right(), r.bottom() - s.border.bottom * z));
+            }
         }
         if (editing && isSel) {
             p.setPen(QPen(Qt::black, 1.0));

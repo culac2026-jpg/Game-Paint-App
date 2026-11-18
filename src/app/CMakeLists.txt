@@ -11,6 +11,7 @@ qt_add_executable(GameArtStudio WIN32
     LayersPanel.cpp
     SlicesPanel.cpp
     TimelinePanel.cpp
+    VectorTools.cpp
     BrushPanel.h
     BrushPanel.cpp
     EffectsPanel.h

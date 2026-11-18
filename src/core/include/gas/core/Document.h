@@ -5,6 +5,7 @@
 #include "gas/core/Selection.h"
 #include "gas/core/TiledImage.h"
 #include "gas/core/Transform.h"
+#include "gas/core/Vector.h"
 
 #include <cstddef>
 #include <deque>
@@ -28,12 +29,24 @@ struct LayerProps {
     friend bool operator==(const LayerProps&, const LayerProps&) = default;
 };
 
+// 9-slice insets in pixels from each edge of a slice (all 0 = not 9-sliced).
+struct SliceBorder {
+    int left = 0;
+    int top = 0;
+    int right = 0;
+    int bottom = 0;
+
+    bool empty() const { return left == 0 && top == 0 && right == 0 && bottom == 0; }
+    friend bool operator==(const SliceBorder&, const SliceBorder&) = default;
+};
+
 // A named sprite region for slicing/atlas export. The pivot is relative to
 // the rect (0,0 = top-left, 1,1 = bottom-right; may lie outside it).
 struct Slice {
     std::string name;
     IRect rect;
     PointF pivot{0.5, 0.5};
+    SliceBorder border; // 9-slice: corners keep their size, edges and centre stretch
 
     friend bool operator==(const Slice&, const Slice&) = default;
 };
@@ -74,6 +87,10 @@ struct Layer {
     // tools and rendering use); the document keeps cels[activeFrame] in sync
     // with it after every operation. Masks and effects belong to the layer.
     std::vector<TiledImage> cels;
+    // Vector layer: the shapes, from which `image` is always rendered (raster
+    // tools refuse to paint it; its mask and effects work as usual). Shapes
+    // belong to the layer, so every frame shows the same picture. Null = raster.
+    std::shared_ptr<const VectorShapes> vector;
     // Rendered "pixels + mask + effects", rebuilt lazily by the document. It
     // validates itself against the content, so copies may share it safely.
     mutable std::shared_ptr<EffectCache> effectCache;
@@ -142,6 +159,16 @@ public:
     bool editingMask() const;
     void setEditingMask(bool editMask) { editingMask_ = editMask; }
 
+    // --- Vector layers ---
+    bool isVectorLayer(int index) const;
+    // New vector layer above the active one (becomes active).
+    bool addVectorLayer(VectorShapes shapes = {}, const std::string& label = "New Vector Layer");
+    // Replaces the shapes of vector layer `index` and re-renders it. Calls with
+    // the same non-zero `mergeToken` (and layer) fold into one step, e.g. a drag.
+    bool setVectorShapes(int index, VectorShapes shapes, const std::string& label = "Edit Shapes", int mergeToken = 0);
+    // Keeps the rendered pixels and drops the shapes (a normal raster layer).
+    bool rasterizeVectorLayer(int index);
+
     // --- Selection (each change is an undo step) ---
     const Selection& selection() const { return selection_; }
     bool setSelection(Selection selection, const std::string& label = "Select");
@@ -152,8 +179,9 @@ public:
     unsigned selectionGeneration() const { return selectionGeneration_; }
 
     // --- Pixel edits on the active layer (or its mask) ---
-    // Returns the image to draw into, or nullptr if the active layer is locked
-    // or hidden, or another edit/transform is in progress. Must be balanced by endEdit().
+    // Returns the image to draw into, or nullptr if the active layer is locked,
+    // hidden or a vector layer (unless its mask is being edited), or another
+    // edit/transform is in progress. Must be balanced by endEdit().
     TiledImage* beginEdit();
     // Pushes the tool's latest changes through the selection clip into the
     // layer, so the canvas can show them mid-stroke. Cheap when nothing changed.
@@ -171,7 +199,9 @@ public:
 
     // --- Transform of the selected pixels (or the whole layer) ---
     // Lifts the content out of the active layer into a floating image; the
-    // preview updates with setTransform() until commit or cancel.
+    // preview updates with setTransform() until commit or cancel. On a vector
+    // layer the whole content is lifted (the selection is ignored) and the
+    // commit transforms the shapes instead of the pixels.
     bool beginTransform();
     bool isTransforming() const { return transform_.has_value(); }
     IRect transformSourceRect() const; // where the floating content started
@@ -265,6 +295,7 @@ public:
     const TiledImage& renderedLayer(int index) const;
 
 private:
+    struct VectorState;
     struct Command {
         Command(std::string l, std::function<void()> u, std::function<void()> r)
             : label(std::move(l)), undo(std::move(u)), redo(std::move(r)) {}
@@ -283,6 +314,14 @@ private:
         // the whole animation state (frame edits) keep -1.
         int frame = -1;
         bool animationState = false;
+        // Mergeable vector edits: the shared "after" state, its layer and token.
+        std::shared_ptr<VectorState> mergeVector;
+        int mergeVectorLayer = -1;
+        int mergeToken = 0;
+    };
+    struct VectorState {
+        std::shared_ptr<const VectorShapes> shapes;
+        std::vector<TiledImage::TilePtr> tiles;
     };
     struct TileChange {
         int tx, ty;
@@ -315,8 +354,10 @@ private:
     void syncCels();
     // Shows frame `index` (no undo step).
     void switchFrame(int index);
-    // Gives a layer one cel per frame with `image` as the active one.
+    // Gives a layer one cel per frame with `image` as the active one (every
+    // cel, for a vector layer).
     void normalizeLayer(Layer& layer) const;
+    static void fillVectorCels(Layer& layer);
     AnimationState animationState();
     // Replaces layers/frames/tags/active frame as one undo step.
     void executeAnimation(const std::string& label, AnimationState after);

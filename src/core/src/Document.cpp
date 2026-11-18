@@ -177,6 +177,12 @@ void Document::execute(Command cmd) {
         *undo_.back().mergeSlices = *cmd.mergeSlices;
         return;
     }
+    if (cmd.mergeVector && cmd.mergeToken != 0 && !undo_.empty() && undo_.back().mergeVector &&
+        undo_.back().mergeToken == cmd.mergeToken && undo_.back().mergeVectorLayer == cmd.mergeVectorLayer &&
+        undo_.back().label == cmd.label && !atCleanState && !hadRedo) {
+        *undo_.back().mergeVector = *cmd.mergeVector;
+        return;
+    }
     if (cleanIndex_ > static_cast<long long>(undo_.size())) {
         cleanIndex_ = -1; // the saved state was in the discarded redo branch
     }
@@ -393,6 +399,7 @@ bool Document::setLayerProps(int index, const LayerProps& props) {
 void Document::replaceLayer(int index, Layer after, const std::string& label) {
     after.cels.resize(frames_.size(), TiledImage(width_, height_));
     after.cels[static_cast<std::size_t>(activeFrame_)] = after.image;
+    fillVectorCels(after);
     const Layer before = layers_[static_cast<std::size_t>(index)];
     execute({label,
              [this, index, before] {
@@ -476,6 +483,7 @@ bool Document::applyLayerMask(int index) {
         after.image = after.cels[static_cast<std::size_t>(activeFrame_)];
     }
     after.mask.reset();
+    after.vector.reset(); // the pixels no longer match the shapes
     replaceLayer(index, std::move(after), "Apply Layer Mask");
     return true;
 }
@@ -502,11 +510,92 @@ bool Document::rasterizeLayerEffects(int index) {
     after.mask.reset();
     after.props.effects.clear();
     after.effectCache.reset();
+    after.vector.reset();
     replaceLayer(index, std::move(after), "Rasterize Effects");
     return true;
 }
 
 bool Document::editingMask() const { return editingMask_ && activeLayer().mask.has_value(); }
+
+// ---------------------------------------------------------------- vector layers
+
+bool Document::isVectorLayer(int index) const {
+    return index >= 0 && index < layerCount() && layers_[static_cast<std::size_t>(index)].vector != nullptr;
+}
+
+bool Document::addVectorLayer(VectorShapes shapes, const std::string& label) {
+    if (busy() || layerCount() >= kMaxLayers) {
+        return false;
+    }
+    const int index = activeLayer_ + 1;
+    const int prevActive = activeLayer_;
+    Layer layer(namedProps("Vector " + std::to_string(createdLayers_ + 1)), rasterizeShapes(shapes, width_, height_));
+    layer.vector = std::make_shared<const VectorShapes>(std::move(shapes));
+    normalizeLayer(layer);
+    ++createdLayers_;
+    execute({label,
+             [this, index, prevActive] {
+                 layers_.erase(layers_.begin() + index);
+                 activeLayer_ = prevActive;
+                 structureDirty_ = true;
+             },
+             [this, index, layer] {
+                 layers_.insert(layers_.begin() + index, layer);
+                 activeLayer_ = index;
+                 structureDirty_ = true;
+             }});
+    return true;
+}
+
+bool Document::setVectorShapes(int index, VectorShapes shapes, const std::string& label, int mergeToken) {
+    if (busy() || !isVectorLayer(index)) {
+        return false;
+    }
+    Layer& l = layers_[static_cast<std::size_t>(index)];
+    if (*l.vector == shapes) {
+        return false;
+    }
+    VectorState before{l.vector, l.image.snapshot()};
+    const TiledImage rendered = rasterizeShapes(shapes, width_, height_);
+    auto after = std::make_shared<VectorState>(
+        VectorState{std::make_shared<const VectorShapes>(std::move(shapes)), rendered.snapshot()});
+    std::size_t bytes = 0;
+    for (std::size_t i = 0; i < after->tiles.size(); ++i) {
+        if (sameContent(before.tiles[i], after->tiles[i])) {
+            after->tiles[i] = before.tiles[i]; // unchanged tiles keep their pointer (no redraw, no memory)
+        } else if (after->tiles[i]) {
+            bytes += sizeof(TiledImage::Tile);
+        }
+    }
+    const auto apply = [this, index](const VectorState& s) {
+        Layer& layer = layers_[static_cast<std::size_t>(index)];
+        layer.vector = s.shapes;
+        const int tx = layer.image.tilesX();
+        for (std::size_t i = 0; i < s.tiles.size(); ++i) {
+            const int x = static_cast<int>(i) % tx, y = static_cast<int>(i) / tx;
+            if (layer.image.sharedTile(x, y) != s.tiles[i]) {
+                layer.image.setTile(x, y, s.tiles[i]);
+            }
+        }
+    };
+    Command cmd{label, [apply, before = std::move(before)] { apply(before); }, [apply, after] { apply(*after); }};
+    cmd.bytes = bytes;
+    cmd.mergeVector = after;
+    cmd.mergeVectorLayer = index;
+    cmd.mergeToken = mergeToken;
+    execute(std::move(cmd));
+    return true;
+}
+
+bool Document::rasterizeVectorLayer(int index) {
+    if (busy() || !isVectorLayer(index)) {
+        return false;
+    }
+    Layer after = layers_[static_cast<std::size_t>(index)];
+    after.vector.reset();
+    replaceLayer(index, std::move(after), "Rasterize Vector Layer");
+    return true;
+}
 
 // ---------------------------------------------------------------- selection
 
@@ -542,6 +631,9 @@ TiledImage* Document::beginEdit() {
         return nullptr;
     }
     const bool mask = editingMask();
+    if (l.vector && !mask) {
+        return nullptr; // shapes are edited with the vector tools
+    }
     TiledImage& target = mask ? *l.mask : l.image;
     // Holding the snapshot makes every tile the tool touches copy-on-write,
     // so `before` stays exactly as it was.
@@ -707,7 +799,7 @@ bool Document::beginTransform() {
         return false;
     }
     TiledImage& img = l.image;
-    const bool useSelection = !selection_.isEmpty();
+    const bool useSelection = !selection_.isEmpty() && !l.vector;
     const IRect area = useSelection ? selection_.bounds().value_or(IRect{}) : contentBounds(img);
     if (area.empty()) {
         return false;
@@ -770,6 +862,12 @@ bool Document::commitTransform(Interpolation interpolation, const std::string& l
     TransformSession s = std::move(*transform_);
     transform_.reset();
     TiledImage& img = layers_[static_cast<std::size_t>(s.layer)].image;
+    if (const auto shapes = layers_[static_cast<std::size_t>(s.layer)].vector) {
+        restoreTiles(img, s.before, {0, 0, width_, height_});
+        img.takeDirtyTiles();
+        markAllDirty();
+        return setVectorShapes(s.layer, transformedShapes(*shapes, s.m), label);
+    }
     restoreTiles(img, s.hole, s.previewArea);
     transformInto(img, s.floating, s.m, interpolation);
 
@@ -843,6 +941,15 @@ void Document::syncCels() {
             l.cels.resize(frames_.size(), TiledImage(width_, height_));
         }
         l.cels[static_cast<std::size_t>(activeFrame_)] = l.image;
+        fillVectorCels(l);
+    }
+}
+
+void Document::fillVectorCels(Layer& layer) {
+    if (layer.vector) {
+        for (TiledImage& c : layer.cels) {
+            c = layer.image;
+        }
     }
 }
 
@@ -859,6 +966,7 @@ void Document::switchFrame(int index) {
 void Document::normalizeLayer(Layer& layer) const {
     layer.cels.resize(frames_.size(), TiledImage(width_, height_));
     layer.cels[static_cast<std::size_t>(activeFrame_)] = layer.image;
+    fillVectorCels(layer);
 }
 
 bool Document::setActiveFrame(int index) {
@@ -878,6 +986,7 @@ Document::AnimationState Document::animationState() {
 
 void Document::executeAnimation(const std::string& label, AnimationState after) {
     for (Layer& l : after.layers) {
+        fillVectorCels(l); // new frames of a vector layer show its shapes too
         l.image = l.cels[static_cast<std::size_t>(after.activeFrame)];
     }
     auto before = std::make_shared<const AnimationState>(animationState());
@@ -1137,6 +1246,12 @@ std::vector<Slice> Document::sanitizedSlices(std::vector<Slice> slices) const {
             continue;
         }
         s.pivot = {clampPivot(s.pivot.x), clampPivot(s.pivot.y)};
+        // Insets stay inside the rect and the opposite pair never crosses.
+        SliceBorder& b = s.border;
+        b.left = std::clamp(b.left, 0, s.rect.w);
+        b.right = std::clamp(b.right, 0, s.rect.w - b.left);
+        b.top = std::clamp(b.top, 0, s.rect.h);
+        b.bottom = std::clamp(b.bottom, 0, s.rect.h - b.top);
         out.push_back(std::move(s));
     }
     return out;
@@ -1196,6 +1311,14 @@ bool Document::crop(IRect area) {
         Layer c(l.props, croppedImage(l.image, area));
         if (l.mask) {
             c.mask = croppedImage(*l.mask, area);
+        }
+        if (l.vector) {
+            c.vector = std::make_shared<const VectorShapes>(
+                transformedShapes(*l.vector, Affine::translate(-area.x, -area.y)));
+            c.image = rasterizeShapes(*c.vector, area.w, area.h);
+            c.cels.assign(frames_.size(), c.image);
+            cropped.push_back(std::move(c));
+            continue;
         }
         for (int f = 0; f < frameCount(); ++f) {
             c.cels.push_back(f == activeFrame_ ? c.image : croppedImage(l.cels[static_cast<std::size_t>(f)], area));

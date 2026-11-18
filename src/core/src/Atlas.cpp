@@ -195,8 +195,9 @@ Atlas packAtlas(const std::vector<AtlasSprite>& sprites, const AtlasSettings& in
         f.sourceHeight = std::max(1, sp.height);
         f.pivot = sp.pivot;
         f.duration = sp.duration;
+        f.border = sp.border;
         f.source = {0, 0, f.sourceWidth, f.sourceHeight};
-        if (s.trim && !s.grid && sp.width > 0 && sp.height > 0 &&
+        if (s.trim && !s.grid && sp.border.empty() && sp.width > 0 && sp.height > 0 &&
             sp.pixels.size() == static_cast<std::size_t>(sp.width) * static_cast<std::size_t>(sp.height)) {
             int x0 = sp.width, y0 = sp.height, x1 = -1, y1 = -1;
             for (int y = 0; y < sp.height; ++y) {
@@ -400,7 +401,8 @@ std::vector<AtlasSprite> spritesFromSlices(const Document& document) {
     const TiledImage image = document.flattenedImage();
     std::vector<AtlasSprite> out;
     for (const Slice& slice : document.slices()) {
-        out.push_back({slice.name, slice.rect.w, slice.rect.h, copyPixels(image, slice.rect), slice.pivot});
+        out.push_back({slice.name, slice.rect.w, slice.rect.h, copyPixels(image, slice.rect), slice.pivot, 0,
+                       slice.border});
     }
     return out;
 }
@@ -430,7 +432,8 @@ std::vector<AtlasSprite> spritesFromFrames(const Document& document, const std::
     for (const Slice& slice : document.slices()) {
         for (int f = 0; f < n; ++f) {
             out.push_back({slice.name + "_" + number(f), slice.rect.w, slice.rect.h,
-                           copyPixels(frames[static_cast<std::size_t>(f)], slice.rect), slice.pivot, duration(f)});
+                           copyPixels(frames[static_cast<std::size_t>(f)], slice.rect), slice.pivot, duration(f),
+                           slice.border});
         }
     }
     return out;
@@ -573,6 +576,10 @@ std::string atlasJson(const Atlas& atlas, int page, const std::string& imageFile
         o += "      \"spriteSourceSize\": {\"x\": " + num(f.source.x) + ", \"y\": " + num(f.source.y) +
              ", \"w\": " + num(f.source.w) + ", \"h\": " + num(f.source.h) + "},\n";
         o += "      \"sourceSize\": {\"w\": " + num(f.sourceWidth) + ", \"h\": " + num(f.sourceHeight) + "},\n";
+        if (!f.border.empty()) {
+            o += "      \"border\": {\"left\": " + num(f.border.left) + ", \"top\": " + num(f.border.top) +
+                 ", \"right\": " + num(f.border.right) + ", \"bottom\": " + num(f.border.bottom) + "},\n";
+        }
         o += "      \"pivot\": {\"x\": " + num(f.pivot.x) + ", \"y\": " + num(f.pivot.y) + "}";
         o += f.duration > 0 ? ",\n      \"duration\": " + num(f.duration) + "\n" : "\n";
         o += k + 1 < frames.size() ? "    },\n" : "    }\n";
@@ -672,7 +679,9 @@ std::string unityMeta(const Atlas& atlas, int page, const AtlasSettings& s, cons
              "\n        y: " + num(pg.height - f.frame.y - f.frame.h) + "\n        width: " + num(f.frame.w) +
              "\n        height: " + num(f.frame.h) + "\n";
         o += "      alignment: 9\n      pivot: {x: " + num(px) + ", y: " + num(py) + "}\n";
-        o += "      border: {x: 0, y: 0, z: 0, w: 0}\n      outline: []\n      physicsShape: []\n";
+        // Unity's border order: x = left, y = bottom, z = right, w = top.
+        o += "      border: {x: " + num(f.border.left) + ", y: " + num(f.border.bottom) + ", z: " +
+             num(f.border.right) + ", w: " + num(f.border.top) + "}\n      outline: []\n      physicsShape: []\n";
         o += "      tessellationDetail: 0\n      bones: []\n";
         o += "      spriteID: " + hex128("gas-sprite:" + imageFile + "/" + f.name) + "\n";
         o += "      internalID: " + internalId(k) + "\n";

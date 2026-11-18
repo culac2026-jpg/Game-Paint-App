@@ -1,6 +1,8 @@
 #include "gas/core/ProjectIO.h"
 
 #include "gas/core/Document.h"
+#include "gas/core/Slicing.h"
+#include "gas/core/Vector.h"
 
 #include <zlib.h>
 
@@ -36,7 +38,10 @@ constexpr std::uint32_t kChunkSlices = fourcc("SLCS");
 constexpr std::uint32_t kChunkFrames = fourcc("FRMS");
 constexpr std::uint32_t kChunkCel = fourcc("CELS");
 constexpr std::uint32_t kChunkTags = fourcc("TAGS");
+constexpr std::uint32_t kChunkVector = fourcc("VECT");
+constexpr std::uint32_t kChunkSliceBorders = fourcc("SLBD");
 constexpr std::uint32_t kChunkEnd = fourcc("END ");
+constexpr std::uint32_t kMaxVectorItems = 1u << 24; // sanity limit for shape/node counts
 
 std::uint32_t crc32Of(const std::uint8_t* data, std::size_t size) {
     return static_cast<std::uint32_t>(crc32_z(crc32_z(0L, Z_NULL, 0), data, size));
@@ -62,6 +67,12 @@ public:
         std::uint32_t bits;
         std::memcpy(&bits, &v, sizeof bits);
         u32(bits);
+    }
+    void f64(double v) {
+        std::uint64_t bits;
+        std::memcpy(&bits, &v, sizeof bits);
+        u32(static_cast<std::uint32_t>(bits));
+        u32(static_cast<std::uint32_t>(bits >> 32));
     }
     void raw(const void* data, std::size_t size) {
         const auto* p = static_cast<const std::uint8_t*>(data);
@@ -98,6 +109,13 @@ public:
     float f32() {
         const std::uint32_t bits = u32();
         float v;
+        std::memcpy(&v, &bits, sizeof v);
+        return v;
+    }
+    double f64() {
+        const std::uint64_t lo = u32();
+        const std::uint64_t bits = lo | static_cast<std::uint64_t>(u32()) << 32;
+        double v;
         std::memcpy(&v, &bits, sizeof v);
         return v;
     }
@@ -240,13 +258,40 @@ IoResult saveProject(const Document& doc, const fs::path& path) {
         lw.raw(name.data(), name.size());
         lw.u8(static_cast<std::uint8_t>((layer.props.visible ? 1 : 0) | (layer.props.locked ? 2 : 0)));
         lw.f32(static_cast<float>(layer.props.opacity));
-        if (!writeTiles(lw, doc.cel(i, 0))) {
+        if (!writeTiles(lw, layer.vector ? TiledImage(doc.width(), doc.height()) : doc.cel(i, 0))) {
             return {false, "Compression failed"};
         }
         if (lw.bytes.size() > 0xFFFFFFFFull) {
             return {false, "Layer \"" + name + "\" is too large to save"};
         }
         w.chunk(kChunkLayer, lw);
+
+        if (layer.vector) {
+            ByteWriter vw;
+            vw.u32(static_cast<std::uint32_t>(i));
+            vw.u32(static_cast<std::uint32_t>(layer.vector->size()));
+            for (const VectorShape& s : *layer.vector) {
+                const VectorStyle& st = s.style;
+                vw.u8(static_cast<std::uint8_t>((st.fill ? 1 : 0) | (st.stroke ? 2 : 0) | (st.antialias ? 4 : 0) |
+                                                (s.path.closed ? 8 : 0)));
+                vw.u8(static_cast<std::uint8_t>(st.join));
+                vw.u8(static_cast<std::uint8_t>(st.cap));
+                for (Rgba8 c : {st.fillColor, st.strokeColor}) {
+                    vw.u8(c.r);
+                    vw.u8(c.g);
+                    vw.u8(c.b);
+                    vw.u8(c.a);
+                }
+                vw.f64(st.strokeWidth);
+                vw.u32(static_cast<std::uint32_t>(s.path.nodes.size()));
+                for (const PathNode& n : s.path.nodes) {
+                    for (double v : {n.p.x, n.p.y, n.in.x, n.in.y, n.out.x, n.out.y}) {
+                        vw.f64(v);
+                    }
+                }
+            }
+            w.chunk(kChunkVector, vw);
+        }
 
         if (layer.mask) {
             ByteWriter mw;
@@ -295,7 +340,7 @@ IoResult saveProject(const Document& doc, const fs::path& path) {
         w.chunk(kChunkFrames, fw);
         for (int i = 0; i < doc.layerCount(); ++i) {
             for (int f = 1; f < doc.frameCount(); ++f) {
-                if (doc.celEmpty(i, f)) {
+                if (doc.celEmpty(i, f) || doc.isVectorLayer(i)) {
                     continue;
                 }
                 ByteWriter cw;
@@ -338,6 +383,18 @@ IoResult saveProject(const Document& doc, const fs::path& path) {
             sw.f32(static_cast<float>(s.pivot.y));
         }
         w.chunk(kChunkSlices, sw);
+        const bool anyBorder = std::any_of(doc.slices().begin(), doc.slices().end(),
+                                           [](const Slice& s) { return !s.border.empty(); });
+        if (anyBorder) {
+            ByteWriter bw;
+            bw.u32(static_cast<std::uint32_t>(doc.slices().size()));
+            for (const Slice& s : doc.slices()) {
+                for (int v : {s.border.left, s.border.top, s.border.right, s.border.bottom}) {
+                    bw.u32(static_cast<std::uint32_t>(v));
+                }
+            }
+            w.chunk(kChunkSliceBorders, bw);
+        }
     }
     w.chunk(kChunkEnd, ByteWriter{});
     w.u32(crc32Of(w.bytes.data(), w.bytes.size()));
@@ -556,6 +613,67 @@ LoadResult loadProject(const fs::path& path) {
                 s.name.assign(reinterpret_cast<const char*>(name), nameLength);
                 slices.push_back(std::move(s));
             }
+        } else if (tag == kChunkVector) {
+            const std::uint32_t index = c.u32();
+            const std::uint32_t count = c.u32();
+            if (!c.ok() || index >= layers.size() || layers[index].vector || count > kMaxVectorItems) {
+                return fail("Invalid vector layer");
+            }
+            VectorShapes shapes;
+            for (std::uint32_t k = 0; k < count; ++k) {
+                VectorShape s;
+                const std::uint8_t flags = c.u8();
+                const std::uint8_t join = c.u8();
+                const std::uint8_t cap = c.u8();
+                for (Rgba8* col : {&s.style.fillColor, &s.style.strokeColor}) {
+                    col->r = c.u8();
+                    col->g = c.u8();
+                    col->b = c.u8();
+                    col->a = c.u8();
+                }
+                const double strokeW = c.f64();
+                const std::uint32_t nodes = c.u32();
+                if (!c.ok() || nodes > c.remaining() / 48) {
+                    return fail("Invalid vector layer");
+                }
+                for (std::uint32_t q = 0; q < nodes; ++q) {
+                    PathNode n;
+                    for (double* v : {&n.p.x, &n.p.y, &n.in.x, &n.in.y, &n.out.x, &n.out.y}) {
+                        *v = c.f64();
+                        if (!std::isfinite(*v)) {
+                            *v = 0;
+                        }
+                    }
+                    s.path.nodes.push_back(n);
+                }
+                if (!c.ok()) {
+                    return fail("Invalid vector layer");
+                }
+                s.style.fill = (flags & 1) != 0;
+                s.style.stroke = (flags & 2) != 0;
+                s.style.antialias = (flags & 4) != 0;
+                s.path.closed = (flags & 8) != 0;
+                s.style.join = join < kLineJoinCount ? static_cast<LineJoin>(join) : LineJoin::Miter;
+                s.style.cap = cap < kLineCapCount ? static_cast<LineCap>(cap) : LineCap::Butt;
+                s.style.strokeWidth = std::isfinite(strokeW) ? std::clamp(strokeW, 0.0, 10000.0) : 1.0;
+                shapes.push_back(std::move(s));
+            }
+            layers[index].image = rasterizeShapes(shapes, width, height);
+            layers[index].vector = std::make_shared<const VectorShapes>(std::move(shapes));
+        } else if (tag == kChunkSliceBorders) {
+            const std::uint32_t count = c.u32();
+            if (!c.ok() || count != slices.size()) {
+                return fail("Invalid slice borders");
+            }
+            for (Slice& s : slices) {
+                s.border.left = static_cast<std::int32_t>(c.u32());
+                s.border.top = static_cast<std::int32_t>(c.u32());
+                s.border.right = static_cast<std::int32_t>(c.u32());
+                s.border.bottom = static_cast<std::int32_t>(c.u32());
+            }
+            if (!c.ok()) {
+                return fail("Invalid slice borders");
+            }
         } else if (tag == kChunkEnd) {
             haveEnd = true;
         }
@@ -576,6 +694,11 @@ LoadResult loadProject(const fs::path& path) {
         }
         for (PendingCel& p : pendingCels) {
             cels[p.layer][p.frame] = std::move(p.image);
+        }
+        for (std::size_t i = 0; i < layers.size(); ++i) {
+            if (layers[i].vector) {
+                cels[i].assign(frames.size(), layers[i].image); // shapes show in every frame
+            }
         }
     }
     auto document = std::make_unique<Document>(width, height, std::move(layers), active);
@@ -643,6 +766,100 @@ IoResult exportPng(const Document& doc, const fs::path& path) {
         return {false, "PNG encoding failed"};
     }
     return writeFileAtomic(path, png);
+}
+
+// ------------------------------------------------------------ SVG
+
+namespace {
+
+std::string base64(const std::vector<std::uint8_t>& data) {
+    static constexpr char kAlphabet[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string out;
+    out.reserve((data.size() + 2) / 3 * 4);
+    for (std::size_t i = 0; i < data.size(); i += 3) {
+        const std::uint32_t b0 = data[i];
+        const std::uint32_t b1 = i + 1 < data.size() ? data[i + 1] : 0;
+        const std::uint32_t b2 = i + 2 < data.size() ? data[i + 2] : 0;
+        const std::uint32_t v = b0 << 16 | b1 << 8 | b2;
+        out += kAlphabet[v >> 18 & 63];
+        out += kAlphabet[v >> 12 & 63];
+        out += i + 1 < data.size() ? kAlphabet[v >> 6 & 63] : '=';
+        out += i + 2 < data.size() ? kAlphabet[v & 63] : '=';
+    }
+    return out;
+}
+
+std::string xmlEscape(const std::string& s) {
+    std::string out;
+    for (char ch : s) {
+        switch (ch) {
+        case '&': out += "&amp;"; break;
+        case '<': out += "&lt;"; break;
+        case '>': out += "&gt;"; break;
+        case '"': out += "&quot;"; break;
+        default: out += ch;
+        }
+    }
+    return out;
+}
+
+const char* cssBlend(BlendMode m) {
+    static constexpr const char* names[kBlendModeCount] = {
+        nullptr,      "multiply",   "screen",     "overlay",    "darken",       "lighten",
+        "color-dodge", "color-burn", "hard-light", "soft-light", "difference",   "exclusion",
+        "plus-lighter", nullptr,     "hue",        "saturation", "color",        "luminosity"};
+    const auto i = static_cast<int>(m);
+    return i >= 0 && i < kBlendModeCount ? names[i] : nullptr;
+}
+
+} // namespace
+
+std::string svgDocument(const Document& doc) {
+    const std::string w = std::to_string(doc.width()), h = std::to_string(doc.height());
+    std::string o = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n";
+    o += "<svg xmlns=\"http://www.w3.org/2000/svg\" xmlns:xlink=\"http://www.w3.org/1999/xlink\" width=\"" + w +
+         "\" height=\"" + h + "\" viewBox=\"0 0 " + w + " " + h + "\">\n";
+    for (int i = 0; i < doc.layerCount(); ++i) {
+        const Layer& l = doc.layer(i);
+        if (!l.props.visible || l.props.opacity <= 0) {
+            continue;
+        }
+        o += "  <g id=\"layer" + std::to_string(i + 1) + "\"";
+        if (l.props.opacity < 1) {
+            char buf[16];
+            std::snprintf(buf, sizeof buf, "%.3f", l.props.opacity);
+            std::string op = buf;
+            std::replace(op.begin(), op.end(), ',', '.');
+            o += " opacity=\"" + op + "\"";
+        }
+        if (const char* blend = cssBlend(l.props.blendMode)) {
+            o += std::string(" style=\"mix-blend-mode:") + blend + "\"";
+        }
+        o += ">\n    <title>" + xmlEscape(l.props.name) + "</title>\n";
+        const bool plainVector = l.vector && !(l.mask && l.props.maskEnabled) && !hasActiveEffects(l.props.effects);
+        if (plainVector) {
+            for (const VectorShape& s : *l.vector) {
+                o += "    " + svgPathElement(s) + "\n";
+            }
+        } else {
+            const TiledImage& img = doc.renderedLayer(i);
+            const IRect r = trimmedRect(img, {0, 0, doc.width(), doc.height()});
+            if (!r.empty()) {
+                o += "    <image x=\"" + std::to_string(r.x) + "\" y=\"" + std::to_string(r.y) + "\" width=\"" +
+                     std::to_string(r.w) + "\" height=\"" + std::to_string(r.h) +
+                     "\" style=\"image-rendering:pixelated\" xlink:href=\"data:image/png;base64," +
+                     base64(encodePng(r.w, r.h, copyPixels(img, r))) + "\"/>\n";
+            }
+        }
+        o += "  </g>\n";
+    }
+    o += "</svg>\n";
+    return o;
+}
+
+IoResult exportSvg(const Document& doc, const fs::path& path) {
+    const std::string text = svgDocument(doc);
+    return writeFileAtomic(path, std::vector<std::uint8_t>(text.begin(), text.end()));
 }
 
 } // namespace gas

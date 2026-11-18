@@ -8,6 +8,7 @@ add_library(gas_core STATIC
     src/StrokeSmoother.cpp
     src/Slicing.cpp
     src/Atlas.cpp
+    src/Vector.cpp
     src/Blend.cpp
     src/Brush.cpp
     src/BrushPresets.cpp

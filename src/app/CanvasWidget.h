@@ -21,7 +21,15 @@ namespace gas {
 class Document;
 }
 
-enum class Tool { Pencil, Brush, Eraser, Fill, Eyedropper, RectSelect, EllipseSelect, Lasso, Move, Smudge, Blur, Slice };
+class VectorEditor;
+
+enum class Tool {
+    Pencil, Brush, Eraser, Fill, Eyedropper, RectSelect, EllipseSelect, Lasso, Move, Smudge, Blur, Slice,
+    Pen, Shape, Node
+};
+
+// Tools that edit vector layers (see VectorEditor).
+inline bool isVectorTool(Tool t) { return t == Tool::Pen || t == Tool::Shape || t == Tool::Node; }
 
 // Tools driven by a gas::BrushTool (size/opacity/hardness, tip, dynamics).
 inline bool usesBrushSettings(Tool t) {
@@ -42,6 +50,9 @@ public:
     void setDocument(gas::Document* document);
 
     double zoom() const { return viewport_.zoom(); }
+    QPointF docToScreenPoint(gas::PointF doc) const;
+    gas::PointF screenToDocPoint(QPointF screen) const { return docAt(screen); }
+    VectorEditor* vectorEditor() const { return vector_; }
     std::optional<gas::Point> cursorPixel() const { return cursorPixel_; }
 
     Tool tool() const { return tool_; }
@@ -106,7 +117,8 @@ public:
 
     // True while a stroke, drag or transform is in progress (undo etc. must wait).
     bool isBusy() const {
-        return editImage_ != nullptr || dragging_ || transform_.has_value() || sliceDrag_.has_value();
+        return editImage_ != nullptr || dragging_ || transform_.has_value() || sliceDrag_.has_value() ||
+               vectorBusy();
     }
 
     void zoomIn();
@@ -154,6 +166,7 @@ private:
         bool oneShot = false; // Move tool: commit on release
     };
 
+    bool vectorBusy() const;
     gas::StrokeTool* strokeTool();
     const gas::BrushTool* brushTool() const;
     gas::TiledImage* beginEdit();
@@ -179,7 +192,8 @@ private:
     void zoomAroundCenter(double factor);
 
     // Slice tool
-    void slicePress(QPointF pos);
+    void slicePress(QPointF pos, Qt::KeyboardModifiers mods);
+    int sliceBorderAt(QPointF pos, bool alt) const; // 9-slice guide of the selected slice: 0..3 = L, T, R, B
     void sliceDragTo(QPointF pos, Qt::KeyboardModifiers mods);
     void finishSliceDrag();
     void nudgeSlice(int dx, int dy);
@@ -200,6 +214,7 @@ private:
     void transformDrag(QPointF pos, Qt::KeyboardModifiers mods);
 
     gas::Document* document_ = nullptr;
+    VectorEditor* vector_ = nullptr;
     gas::TiledImage* editImage_ = nullptr; // active layer during a stroke
     gas::Viewport viewport_;
     QHash<quint64, QImage> tileCache_;
@@ -243,9 +258,9 @@ private:
 
     // Slices
     struct SliceDrag {
-        enum class Mode { Create, Move, Resize, Pivot } mode = Mode::Create;
+        enum class Mode { Create, Move, Resize, Pivot, Border } mode = Mode::Create;
         int index = -1;  // slice being edited (-1 while creating)
-        int handle = -1; // Resize: 0..7 = TL, T, TR, R, BR, B, BL, L
+        int handle = -1; // Resize: 0..7 = TL, T, TR, R, BR, B, BL, L; Border: 0..3 = L, T, R, B
         gas::PointF startDoc;
         gas::Slice start;
         gas::Slice current; // preview, committed on release

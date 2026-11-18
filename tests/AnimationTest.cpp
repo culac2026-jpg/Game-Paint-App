@@ -249,7 +249,7 @@ TEST(Animation, ExportSheetWithUniformPivot) {
     EXPECT_NE(meta.find("pivot: {x: 0.5, y: -0.75}"), std::string::npos);
 
     // Per-slice animation: frames x slices, tags per slice.
-    doc.setSlices({{"body", {8, 8, 16, 24}, {0.5, 1.0}}});
+    doc.setSlices({{"body", {8, 8, 16, 24}, {0.5, 1.0}, {}}});
     const std::vector<AtlasSprite> sliced = spritesFromFrames(doc, "hero", pivot);
     ASSERT_EQ(sliced.size(), 4u);
     EXPECT_EQ(sliced[2].name, "body_02");
