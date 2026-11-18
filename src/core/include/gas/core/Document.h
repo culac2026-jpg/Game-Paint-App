@@ -1,6 +1,8 @@
 #pragma once
 
+#include "gas/core/Selection.h"
 #include "gas/core/TiledImage.h"
+#include "gas/core/Transform.h"
 
 #include <cstddef>
 #include <deque>
@@ -16,7 +18,8 @@ struct LayerProps {
     std::string name;
     bool visible = true;
     bool locked = false;
-    double opacity = 1.0; // 0..1
+    double opacity = 1.0;    // 0..1
+    bool maskEnabled = true; // ignored when the layer has no mask
 
     friend bool operator==(const LayerProps&, const LayerProps&) = default;
 };
@@ -24,6 +27,9 @@ struct LayerProps {
 struct Layer {
     LayerProps props;
     TiledImage image;
+    // Non-destructive layer mask, painted like any image; see maskValue()
+    // (unpainted = shown, black = hidden).
+    std::optional<TiledImage> mask;
 };
 
 // A layered raster document with linear undo/redo.
@@ -33,6 +39,10 @@ struct Layer {
 // with beginEdit()/endEdit(). Undo steps hold copy-on-write tile pointers, so
 // a step costs only the tiles it actually changed. History is capped by an
 // estimate of the memory it holds; the oldest steps are dropped first.
+//
+// While a selection exists, pixel edits cannot change anything outside it:
+// tools draw into a scratch copy, and syncEdit()/endEdit() write
+// mix(original, scratch, coverage) into the real layer.
 class Document {
 public:
     static constexpr int kMaxSize = 16384;
@@ -42,7 +52,7 @@ public:
     // A document with one empty layer named "Layer 1".
     Document(int width, int height);
     // From existing layers (e.g. a loaded file); throws std::invalid_argument
-    // if empty, too many, or any layer's size differs from the document.
+    // if empty, too many, or any layer's (or mask's) size differs from the document.
     Document(int width, int height, std::vector<Layer> layers, int activeLayer);
     ~Document();
 
@@ -69,17 +79,63 @@ public:
     // Consecutive edits to the same layer's properties merge into one step.
     bool setLayerProps(int index, const LayerProps& props);
 
-    // --- Pixel edits on the active layer ---
+    // --- Layer masks ---
+    // Adds a mask showing everything, or only the selection if one exists,
+    // and starts editing it.
+    bool addLayerMask(int index);
+    bool removeLayerMask(int index);
+    // Bakes the mask into the layer's alpha and removes it.
+    bool applyLayerMask(int index);
+    // Whether pixel edits target the active layer's mask (a view choice).
+    bool editingMask() const;
+    void setEditingMask(bool editMask) { editingMask_ = editMask; }
+
+    // --- Selection (each change is an undo step) ---
+    const Selection& selection() const { return selection_; }
+    bool setSelection(Selection selection, const std::string& label = "Select");
+    bool selectAll();
+    bool deselect();
+    bool invertSelection();
+    // Increments whenever the selection changes (incl. undo/redo), for view caches.
+    unsigned selectionGeneration() const { return selectionGeneration_; }
+
+    // --- Pixel edits on the active layer (or its mask) ---
     // Returns the image to draw into, or nullptr if the active layer is locked
-    // or hidden. Must be balanced by endEdit().
+    // or hidden, or another edit/transform is in progress. Must be balanced by endEdit().
     TiledImage* beginEdit();
+    // Pushes the tool's latest changes through the selection clip into the
+    // layer, so the canvas can show them mid-stroke. Cheap when nothing changed.
+    void syncEdit();
     // Records one undo step named `label` if any pixel changed; returns whether it did.
     bool endEdit(const std::string& label);
     bool isEditing() const { return edit_.has_value(); }
 
+    // Clears / fills the selected pixels (the whole layer if nothing is selected).
+    bool eraseSelected();
+    bool fillSelected(Rgba8 color);
+
+    // --- Transform of the selected pixels (or the whole layer) ---
+    // Lifts the content out of the active layer into a floating image; the
+    // preview updates with setTransform() until commit or cancel.
+    bool beginTransform();
+    bool isTransforming() const { return transform_.has_value(); }
+    IRect transformSourceRect() const; // where the floating content started
+    Affine currentTransform() const;
+    void setTransform(const Affine& m);
+    // One undo step (pixels + selection). An identity transform cancels instead.
+    bool commitTransform(Interpolation interpolation, const std::string& label = "Transform");
+    void cancelTransform();
+    // One-shot helpers (begin, set, commit); exact for pixel art.
+    bool flipContent(bool horizontal);
+    bool rotateContent90(bool clockwise);
+
+    // --- Canvas ---
+    // Crops every layer (and mask) to `area`; deselects. One undo step.
+    bool crop(IRect area);
+
     // --- History ---
-    bool canUndo() const { return !undo_.empty() && !isEditing(); }
-    bool canRedo() const { return !redo_.empty() && !isEditing(); }
+    bool canUndo() const { return !undo_.empty() && !busy(); }
+    bool canRedo() const { return !redo_.empty() && !busy(); }
     std::string undoLabel() const;
     std::string redoLabel() const;
     bool undo();
@@ -116,23 +172,52 @@ private:
         int mergeLayer = -1;
         std::shared_ptr<LayerProps> mergeAfter;
     };
+    struct TileChange {
+        int tx, ty;
+        TiledImage::TilePtr before, after;
+    };
     struct EditSession {
         int layer;
+        bool mask;
         std::vector<TiledImage::TilePtr> before;
+        std::optional<TiledImage> scratch; // only while a selection clips the edit
+    };
+    struct TransformSession {
+        int layer;
+        std::vector<TiledImage::TilePtr> before; // layer before lifting
+        std::vector<TiledImage::TilePtr> hole;   // layer with the content lifted out
+        FloatingImage floating;
+        Selection selectionBefore;
+        Affine m;
+        IRect previewArea; // pixels the current preview wrote over the hole
     };
 
+    bool busy() const { return edit_.has_value() || transform_.has_value(); }
+    TiledImage& targetImage(int layer, bool mask);
     // Applies `cmd` (runs redo) and records it.
     void execute(Command cmd);
     void enforceHistoryLimit();
     std::string nextLayerName() const;
+    // Tiles of `image` that differ in content from `before`.
+    static std::vector<TileChange> diffTiles(const std::vector<TiledImage::TilePtr>& before,
+                                             const TiledImage& image, std::size_t& bytes);
+    Command tileCommand(const std::string& label, int layer, bool mask, std::vector<TileChange> changes,
+                        std::size_t bytes);
+    // Replaces layer `index` wholesale as one undo step.
+    void replaceLayer(int index, Layer after, const std::string& label);
+    void restoreTiles(TiledImage& image, const std::vector<TiledImage::TilePtr>& from, IRect area);
 
     int width_;
     int height_;
     std::vector<Layer> layers_;
     int activeLayer_ = 0;
     bool structureDirty_ = true;
+    bool editingMask_ = false;
+    Selection selection_;
+    unsigned selectionGeneration_ = 0;
 
     std::optional<EditSession> edit_;
+    std::optional<TransformSession> transform_;
     std::deque<Command> undo_;
     std::vector<Command> redo_;
     std::size_t historyLimit_ = kDefaultHistoryLimit;

@@ -19,15 +19,21 @@ class Document;
 //     "DOCM" u32 width, u32 height, u32 activeLayer, u32 layerCount
 //     "LAYR" one per layer, bottom to top:
 //            u16 nameLength, UTF-8 name, u8 flags (1 = visible, 2 = locked),
-//            f32 opacity, u32 tileCount, then per tile:
-//            u32 tx, u32 ty, u32 compressedSize, zlib(256*256 RGBA8 straight alpha)
+//            f32 opacity, TILES
+//     "LMSK" (version 2+) optional, after its layer: u32 layerIndex,
+//            u8 flags (1 = mask enabled), TILES
 //     "END "
 //   u32 CRC-32 of every preceding byte
 //
+//   TILES = u32 tileCount, then per tile:
+//           u32 tx, u32 ty, u32 compressedSize, zlib(256*256 RGBA8 straight alpha)
+//
 // Only non-empty tiles are stored. Saves are atomic: written to a temporary
 // sibling file, then renamed over the target, so a failed save never damages
-// an existing file. Undo history is not saved.
-inline constexpr std::uint32_t kProjectFormatVersion = 1;
+// an existing file. Undo history and the selection are not saved.
+// Version history: 1 = v0.3 (layers), 2 = v0.4 (layer masks). Older versions
+// still load; newer ones are refused.
+inline constexpr std::uint32_t kProjectFormatVersion = 2;
 inline constexpr const char* kProjectExtension = ".gas";
 
 struct IoResult {

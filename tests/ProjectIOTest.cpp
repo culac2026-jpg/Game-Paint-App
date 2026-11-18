@@ -276,6 +276,50 @@ TEST_F(ProjectIOTest, RejectsNewerFormatVersion) {
     EXPECT_NE(r.error.find("newer version"), std::string::npos) << r.error;
 }
 
+TEST_F(ProjectIOTest, LayerMasksRoundTrip) {
+    Document doc(300, 300);
+    doc.fillSelected(kRed);
+    doc.setSelection(gas::Selection::rect(300, 300, {10, 10, 100, 100}));
+    ASSERT_TRUE(doc.addLayerMask(0));
+    auto p = doc.layer(0).props;
+    p.maskEnabled = false;
+    doc.setLayerProps(0, p);
+    doc.addLayer(); // a second layer without a mask
+
+    const fs::path file = dir_ / "masks.gas";
+    ASSERT_TRUE(gas::saveProject(doc, file).ok);
+    const auto loaded = gas::loadProject(file);
+    ASSERT_TRUE(loaded.document) << loaded.error;
+    const Document& d = *loaded.document;
+    ASSERT_TRUE(d.layer(0).mask.has_value());
+    EXPECT_FALSE(d.layer(1).mask.has_value());
+    EXPECT_FALSE(d.layer(0).props.maskEnabled);
+    for (int y = 0; y < 300; y += 7) {
+        for (int x = 0; x < 300; x += 7) {
+            ASSERT_EQ(d.layer(0).mask->pixel({x, y}), doc.layer(0).mask->pixel({x, y})) << x << "," << y;
+        }
+    }
+    EXPECT_EQ(d.flatten(), doc.flatten());
+}
+
+TEST_F(ProjectIOTest, LoadsVersion1Files) {
+    // A v1 file is a v2 file without LMSK chunks; patch the version field.
+    Document doc(40, 40);
+    dot(doc, {3, 4}, kRed);
+    const fs::path file = dir_ / "v1.gas";
+    ASSERT_TRUE(gas::saveProject(doc, file).ok);
+    auto bytes = readAll(file);
+    bytes[8] = 1;
+    const uLong crc = crc32(crc32(0, nullptr, 0), bytes.data(), static_cast<uInt>(bytes.size() - 4));
+    for (int i = 0; i < 4; ++i) {
+        bytes[bytes.size() - 4 + static_cast<std::size_t>(i)] = static_cast<std::uint8_t>(crc >> (8 * i));
+    }
+    writeAll(file, bytes);
+    const auto loaded = gas::loadProject(file);
+    ASSERT_TRUE(loaded.document) << loaded.error;
+    EXPECT_EQ(loaded.document->compositePixel({3, 4}), kRed);
+}
+
 TEST_F(ProjectIOTest, PngExportKeepsSizeColoursAndTransparency) {
     // Plan acceptance: PNG keeps exact size, colours and transparent pixels.
     Document doc(300, 7);

@@ -28,22 +28,77 @@ bool sameContent(const TiledImage::TilePtr& a, const TiledImage::TilePtr& b) {
     return std::memcmp(a->pixels.data(), b->pixels.data(), sizeof(a->pixels)) == 0;
 }
 
+// Bounds of the non-transparent pixels of `image`.
+IRect contentBounds(const TiledImage& image) {
+    IRect result;
+    for (int ty = 0; ty < image.tilesY(); ++ty) {
+        for (int tx = 0; tx < image.tilesX(); ++tx) {
+            const TiledImage::Tile* t = image.tile(tx, ty);
+            if (!t) {
+                continue;
+            }
+            int minX = kTile, minY = kTile, maxX = -1, maxY = -1;
+            for (int y = 0; y < kTile; ++y) {
+                for (int x = 0; x < kTile; ++x) {
+                    if (t->pixels[static_cast<std::size_t>(y * kTile + x)].a != 0) {
+                        minX = std::min(minX, x);
+                        maxX = std::max(maxX, x);
+                        minY = std::min(minY, y);
+                        maxY = std::max(maxY, y);
+                    }
+                }
+            }
+            if (maxX >= 0) {
+                result = result.united({tx * kTile + minX, ty * kTile + minY, maxX - minX + 1, maxY - minY + 1});
+            }
+        }
+    }
+    return result.intersected({0, 0, image.width(), image.height()});
+}
+
+// The pixels of `src` inside `area`, as an image of size area.w x area.h.
+TiledImage croppedImage(const TiledImage& src, IRect area) {
+    TiledImage out(area.w, area.h);
+    if (area.x % kTile == 0 && area.y % kTile == 0) {
+        // Tile-aligned: share tiles instead of copying pixels.
+        for (int ty = 0; ty < out.tilesY(); ++ty) {
+            for (int tx = 0; tx < out.tilesX(); ++tx) {
+                if (auto t = src.sharedTile(tx + area.x / kTile, ty + area.y / kTile)) {
+                    out.setTile(tx, ty, std::move(t));
+                }
+            }
+        }
+    } else {
+        for (int y = 0; y < area.h; ++y) {
+            for (int x = 0; x < area.w; ++x) {
+                const Rgba8 p = src.pixel({area.x + x, area.y + y});
+                if (p.a != 0) {
+                    out.setPixel({x, y}, p);
+                }
+            }
+        }
+    }
+    out.takeDirtyTiles();
+    return out;
+}
+
 } // namespace
 
-Document::Document(int width, int height) : width_(width), height_(height) {
+Document::Document(int width, int height) : width_(width), height_(height), selection_(width, height) {
     checkSize(width, height);
-    layers_.push_back({{nextLayerName()}, TiledImage(width, height)});
+    layers_.push_back({{nextLayerName()}, TiledImage(width, height), std::nullopt});
     ++createdLayers_;
 }
 
 Document::Document(int width, int height, std::vector<Layer> layers, int activeLayer)
-    : width_(width), height_(height), layers_(std::move(layers)) {
+    : width_(width), height_(height), layers_(std::move(layers)), selection_(width, height) {
     checkSize(width, height);
     if (layers_.empty() || layers_.size() > static_cast<std::size_t>(kMaxLayers)) {
         throw std::invalid_argument("Document needs between 1 and 1000 layers");
     }
     for (const Layer& l : layers_) {
-        if (l.image.width() != width || l.image.height() != height) {
+        if (l.image.width() != width || l.image.height() != height ||
+            (l.mask && (l.mask->width() != width || l.mask->height() != height))) {
             throw std::invalid_argument("Layer size does not match the document");
         }
     }
@@ -56,9 +111,14 @@ Document::~Document() = default;
 std::string Document::nextLayerName() const { return "Layer " + std::to_string(createdLayers_ + 1); }
 
 void Document::setActiveLayer(int index) {
-    if (index >= 0 && index < layerCount()) {
+    if (index >= 0 && index < layerCount() && !busy()) {
         activeLayer_ = index;
     }
+}
+
+TiledImage& Document::targetImage(int layer, bool mask) {
+    Layer& l = layers_[static_cast<std::size_t>(layer)];
+    return mask ? *l.mask : l.image;
 }
 
 // ---------------------------------------------------------------- history
@@ -139,9 +199,12 @@ void Document::markSaved() { cleanIndex_ = static_cast<long long>(undo_.size());
 // ---------------------------------------------------------------- layer edits
 
 void Document::addLayer() {
+    if (busy()) {
+        return;
+    }
     const int index = activeLayer_ + 1;
     const int prevActive = activeLayer_;
-    Layer layer{{nextLayerName()}, TiledImage(width_, height_)};
+    Layer layer{{nextLayerName()}, TiledImage(width_, height_), std::nullopt};
     ++createdLayers_;
     execute({"New Layer",
              [this, index, prevActive] {
@@ -157,7 +220,7 @@ void Document::addLayer() {
 }
 
 bool Document::duplicateLayer(int index) {
-    if (index < 0 || index >= layerCount() || layerCount() >= kMaxLayers) {
+    if (busy() || index < 0 || index >= layerCount() || layerCount() >= kMaxLayers) {
         return false;
     }
     Layer copy = layers_[static_cast<std::size_t>(index)]; // shares tiles (copy-on-write)
@@ -179,7 +242,7 @@ bool Document::duplicateLayer(int index) {
 }
 
 bool Document::removeLayer(int index) {
-    if (index < 0 || index >= layerCount() || layerCount() <= 1) {
+    if (busy() || index < 0 || index >= layerCount() || layerCount() <= 1) {
         return false;
     }
     const Layer removed = layers_[static_cast<std::size_t>(index)];
@@ -199,7 +262,7 @@ bool Document::removeLayer(int index) {
 }
 
 bool Document::moveLayer(int from, int to) {
-    if (from < 0 || to < 0 || from >= layerCount() || to >= layerCount() || from == to) {
+    if (busy() || from < 0 || to < 0 || from >= layerCount() || to >= layerCount() || from == to) {
         return false;
     }
     const int prevActive = activeLayer_;
@@ -222,7 +285,7 @@ bool Document::moveLayer(int from, int to) {
 }
 
 bool Document::setLayerProps(int index, const LayerProps& props) {
-    if (index < 0 || index >= layerCount()) {
+    if (busy() || index < 0 || index >= layerCount()) {
         return false;
     }
     LayerProps clean = props;
@@ -247,64 +310,430 @@ bool Document::setLayerProps(int index, const LayerProps& props) {
     return true;
 }
 
+void Document::replaceLayer(int index, Layer after, const std::string& label) {
+    const Layer before = layers_[static_cast<std::size_t>(index)];
+    execute({label,
+             [this, index, before] {
+                 layers_[static_cast<std::size_t>(index)] = before;
+                 structureDirty_ = true;
+             },
+             [this, index, after] {
+                 layers_[static_cast<std::size_t>(index)] = after;
+                 structureDirty_ = true;
+             }});
+}
+
+// ---------------------------------------------------------------- layer masks
+
+bool Document::addLayerMask(int index) {
+    if (busy() || index < 0 || index >= layerCount() || layers_[static_cast<std::size_t>(index)].mask) {
+        return false;
+    }
+    TiledImage mask(width_, height_); // unpainted = everything shown
+    if (!selection_.isEmpty()) {
+        // Reveal only the selection: black where unselected, grey ramps on soft edges.
+        auto black = std::make_shared<TiledImage::Tile>();
+        black->pixels.fill(Rgba8::black());
+        const TiledImage::TilePtr blackTile = black;
+        for (int ty = 0; ty < mask.tilesY(); ++ty) {
+            for (int tx = 0; tx < mask.tilesX(); ++tx) {
+                const Selection::MaskTile* s = selection_.tile(tx, ty);
+                if (!s) {
+                    mask.setTile(tx, ty, blackTile);
+                } else if (!selection_.tileFullySelected(tx, ty)) {
+                    auto t = std::make_shared<TiledImage::Tile>();
+                    for (std::size_t i = 0; i < t->pixels.size(); ++i) {
+                        const std::uint8_t v = (*s)[i];
+                        t->pixels[i] = {v, v, v, 255};
+                    }
+                    mask.setTile(tx, ty, std::move(t));
+                }
+            }
+        }
+        mask.takeDirtyTiles();
+    }
+    Layer after = layers_[static_cast<std::size_t>(index)];
+    after.mask = std::move(mask);
+    after.props.maskEnabled = true;
+    replaceLayer(index, std::move(after), "Add Layer Mask");
+    editingMask_ = true;
+    return true;
+}
+
+bool Document::removeLayerMask(int index) {
+    if (busy() || index < 0 || index >= layerCount() || !layers_[static_cast<std::size_t>(index)].mask) {
+        return false;
+    }
+    Layer after = layers_[static_cast<std::size_t>(index)];
+    after.mask.reset();
+    replaceLayer(index, std::move(after), "Delete Layer Mask");
+    return true;
+}
+
+bool Document::applyLayerMask(int index) {
+    if (busy() || index < 0 || index >= layerCount() || !layers_[static_cast<std::size_t>(index)].mask) {
+        return false;
+    }
+    Layer after = layers_[static_cast<std::size_t>(index)];
+    if (after.props.maskEnabled) {
+        for (int ty = 0; ty < after.image.tilesY(); ++ty) {
+            for (int tx = 0; tx < after.image.tilesX(); ++tx) {
+                const TiledImage::Tile* m = after.mask->tile(tx, ty);
+                if (!m || !after.image.tile(tx, ty)) {
+                    continue; // unpainted mask = fully shown; empty layer tile stays empty
+                }
+                TiledImage::Tile& t = after.image.editTile(tx, ty);
+                for (std::size_t i = 0; i < t.pixels.size(); ++i) {
+                    t.pixels[i] = eraseAlpha(t.pixels[i], 1.0 - maskValue(m->pixels[i]) / 255.0);
+                }
+            }
+        }
+        after.image.takeDirtyTiles();
+    }
+    after.mask.reset();
+    replaceLayer(index, std::move(after), "Apply Layer Mask");
+    return true;
+}
+
+bool Document::editingMask() const { return editingMask_ && activeLayer().mask.has_value(); }
+
+// ---------------------------------------------------------------- selection
+
+bool Document::setSelection(Selection selection, const std::string& label) {
+    if (busy() || selection.width() != width_ || selection.height() != height_ || selection == selection_) {
+        return false;
+    }
+    const Selection before = selection_;
+    execute({label,
+             [this, before] {
+                 selection_ = before;
+                 ++selectionGeneration_;
+             },
+             [this, after = std::move(selection)] {
+                 selection_ = after;
+                 ++selectionGeneration_;
+             }});
+    return true;
+}
+
+bool Document::selectAll() { return setSelection(Selection::all(width_, height_), "Select All"); }
+bool Document::deselect() { return setSelection(Selection(width_, height_), "Deselect"); }
+bool Document::invertSelection() { return setSelection(selection_.inverted(), "Invert Selection"); }
+
 // ---------------------------------------------------------------- pixel edits
 
 TiledImage* Document::beginEdit() {
-    if (edit_) {
-        throw std::logic_error("beginEdit() called twice without endEdit()");
+    if (busy()) {
+        return nullptr;
     }
     Layer& l = layers_[static_cast<std::size_t>(activeLayer_)];
     if (l.props.locked || !l.props.visible) {
         return nullptr;
     }
+    const bool mask = editingMask();
+    TiledImage& target = mask ? *l.mask : l.image;
     // Holding the snapshot makes every tile the tool touches copy-on-write,
     // so `before` stays exactly as it was.
-    edit_ = EditSession{activeLayer_, l.image.snapshot()};
-    return &l.image;
+    edit_ = EditSession{activeLayer_, mask, target.snapshot(), std::nullopt};
+    if (selection_.isEmpty()) {
+        return &target;
+    }
+    edit_->scratch = target; // shares tiles; the tool writes here, syncEdit() clips into target
+    edit_->scratch->takeDirtyTiles();
+    return &*edit_->scratch;
+}
+
+void Document::syncEdit() {
+    if (!edit_ || !edit_->scratch) {
+        return;
+    }
+    TiledImage& scratch = *edit_->scratch;
+    TiledImage& target = targetImage(edit_->layer, edit_->mask);
+    for (const Point& t : scratch.takeDirtyTiles()) {
+        const Selection::MaskTile* cov = selection_.tile(t.x, t.y);
+        if (!cov) {
+            continue; // nothing selected here: the target keeps its original tile
+        }
+        if (selection_.tileFullySelected(t.x, t.y)) {
+            target.setTile(t.x, t.y, scratch.sharedTile(t.x, t.y));
+            continue;
+        }
+        // Always recompute from the original, so repeated syncs never compound.
+        const TiledImage::TilePtr& before = edit_->before[static_cast<std::size_t>(t.y * scratch.tilesX() + t.x)];
+        const TiledImage::Tile* drawn = scratch.tile(t.x, t.y);
+        auto out = std::make_shared<TiledImage::Tile>();
+        for (std::size_t i = 0; i < out->pixels.size(); ++i) {
+            const Rgba8 b = before ? before->pixels[i] : Rgba8::transparent();
+            const Rgba8 a = drawn ? drawn->pixels[i] : Rgba8::transparent();
+            const std::uint8_t c = (*cov)[i];
+            out->pixels[i] = c == 255 ? a : c == 0 ? b : mix(b, a, c / 255.0);
+        }
+        target.setTile(t.x, t.y, std::move(out));
+    }
+}
+
+std::vector<Document::TileChange> Document::diffTiles(const std::vector<TiledImage::TilePtr>& before,
+                                                      const TiledImage& image, std::size_t& bytes) {
+    std::vector<TileChange> changes;
+    bytes = 0;
+    const std::vector<TiledImage::TilePtr> after = image.snapshot();
+    const int tx = image.tilesX();
+    for (std::size_t i = 0; i < after.size(); ++i) {
+        if (sameContent(before[i], after[i])) {
+            continue;
+        }
+        changes.push_back({static_cast<int>(i) % tx, static_cast<int>(i) / tx, before[i], after[i]});
+        bytes += (before[i] ? sizeof(TiledImage::Tile) : 0) + (after[i] ? sizeof(TiledImage::Tile) : 0);
+    }
+    return changes;
+}
+
+Document::Command Document::tileCommand(const std::string& label, int layer, bool mask,
+                                        std::vector<TileChange> changes, std::size_t bytes) {
+    // The tiles are already in place, so the first redo just re-sets them.
+    auto shared = std::make_shared<const std::vector<TileChange>>(std::move(changes));
+    Command cmd{label,
+                [this, layer, mask, shared] {
+                    for (const TileChange& c : *shared) {
+                        targetImage(layer, mask).setTile(c.tx, c.ty, c.before);
+                    }
+                },
+                [this, layer, mask, shared] {
+                    for (const TileChange& c : *shared) {
+                        targetImage(layer, mask).setTile(c.tx, c.ty, c.after);
+                    }
+                }};
+    cmd.bytes = bytes;
+    return cmd;
 }
 
 bool Document::endEdit(const std::string& label) {
     if (!edit_) {
         return false;
     }
+    syncEdit();
     EditSession session = std::move(*edit_);
     edit_.reset();
-    TiledImage& image = layers_[static_cast<std::size_t>(session.layer)].image;
-    const std::vector<TiledImage::TilePtr> after = image.snapshot();
-
-    struct Change {
-        int tx, ty;
-        TiledImage::TilePtr before, after;
-    };
-    std::vector<Change> changes;
     std::size_t bytes = 0;
-    const int tx = image.tilesX();
-    for (std::size_t i = 0; i < after.size(); ++i) {
-        if (sameContent(session.before[i], after[i])) {
-            continue;
-        }
-        changes.push_back({static_cast<int>(i) % tx, static_cast<int>(i) / tx, session.before[i], after[i]});
-        bytes += (session.before[i] ? sizeof(TiledImage::Tile) : 0) +
-                 (after[i] ? sizeof(TiledImage::Tile) : 0);
-    }
+    std::vector<TileChange> changes = diffTiles(session.before, targetImage(session.layer, session.mask), bytes);
     if (changes.empty()) {
         return false;
     }
-    const int layer = session.layer;
-    // The tiles are already in place, so the first redo just re-sets them.
+    execute(tileCommand(label, session.layer, session.mask, std::move(changes), bytes));
+    return true;
+}
+
+bool Document::eraseSelected() { return fillSelected(Rgba8::transparent()); }
+
+bool Document::fillSelected(Rgba8 color) {
+    TiledImage* img = beginEdit();
+    if (!img) {
+        return false;
+    }
+    const IRect area = selection_.bounds().value_or(IRect{0, 0, width_, height_});
+    const bool clear = color.a == 0;
+    for (int ty = area.y / kTile; ty <= (area.bottom() - 1) / kTile; ++ty) {
+        for (int tx = area.x / kTile; tx <= (area.right() - 1) / kTile; ++tx) {
+            const IRect part = area.intersected({tx * kTile, ty * kTile, kTile, kTile});
+            if (clear && part.w == kTile && part.h == kTile) {
+                img->setTile(tx, ty, nullptr); // whole tile: drop it
+                continue;
+            }
+            TiledImage::Tile& t = img->editTile(tx, ty);
+            for (int y = part.y; y < part.bottom(); ++y) {
+                for (int x = part.x; x < part.right(); ++x) {
+                    t.pixels[static_cast<std::size_t>(TiledImage::pixelIndex(x, y))] = clear ? Rgba8::transparent()
+                                                                                              : color;
+                }
+            }
+        }
+    }
+    return endEdit(clear ? "Clear" : "Fill");
+}
+
+// ---------------------------------------------------------------- transform
+
+void Document::restoreTiles(TiledImage& image, const std::vector<TiledImage::TilePtr>& from, IRect area) {
+    if (area.empty()) {
+        return;
+    }
+    for (int ty = area.y / kTile; ty <= (area.bottom() - 1) / kTile; ++ty) {
+        for (int tx = area.x / kTile; tx <= (area.right() - 1) / kTile; ++tx) {
+            const auto& tile = from[static_cast<std::size_t>(ty * image.tilesX() + tx)];
+            if (image.sharedTile(tx, ty) != tile) {
+                image.setTile(tx, ty, tile);
+            }
+        }
+    }
+}
+
+bool Document::beginTransform() {
+    if (busy()) {
+        return false;
+    }
+    Layer& l = layers_[static_cast<std::size_t>(activeLayer_)];
+    if (l.props.locked || !l.props.visible) {
+        return false;
+    }
+    TiledImage& img = l.image;
+    const bool useSelection = !selection_.isEmpty();
+    const IRect area = useSelection ? selection_.bounds().value_or(IRect{}) : contentBounds(img);
+    if (area.empty()) {
+        return false;
+    }
+
+    TransformSession s{activeLayer_, img.snapshot(), {}, {}, selection_, Affine{}, {}};
+    s.floating.rect = area;
+    s.floating.pixels.resize(static_cast<std::size_t>(area.w) * static_cast<std::size_t>(area.h));
+    bool anything = false;
+    for (int y = area.y; y < area.bottom(); ++y) {
+        for (int x = area.x; x < area.right(); ++x) {
+            const Rgba8 p = img.pixel({x, y});
+            const std::uint8_t c = useSelection ? selection_.coverage({x, y}) : 255;
+            if (p.a == 0 || c == 0) {
+                continue;
+            }
+            Rgba8 lifted = p;
+            if (c < 255) {
+                lifted = eraseAlpha(p, 1.0 - c / 255.0); // the selected share of the pixel
+            }
+            s.floating.pixels[static_cast<std::size_t>(y - area.y) * static_cast<std::size_t>(area.w) +
+                              static_cast<std::size_t>(x - area.x)] = lifted;
+            img.setPixel({x, y}, c == 255 ? Rgba8::transparent() : eraseAlpha(p, c / 255.0));
+            anything = anything || lifted.a != 0;
+        }
+    }
+    if (!anything) {
+        restoreTiles(img, s.before, area);
+        img.takeDirtyTiles();
+        return false; // only transparent pixels selected
+    }
+    s.hole = img.snapshot();
+    s.previewArea = transformInto(img, s.floating, s.m, Interpolation::Nearest);
+    transform_ = std::move(s);
+    return true;
+}
+
+IRect Document::transformSourceRect() const { return transform_ ? transform_->floating.rect : IRect{}; }
+
+Affine Document::currentTransform() const { return transform_ ? transform_->m : Affine{}; }
+
+void Document::setTransform(const Affine& m) {
+    if (!transform_) {
+        return;
+    }
+    TiledImage& img = layers_[static_cast<std::size_t>(transform_->layer)].image;
+    restoreTiles(img, transform_->hole, transform_->previewArea);
+    transform_->m = m;
+    transform_->previewArea = transformInto(img, transform_->floating, m, Interpolation::Nearest);
+}
+
+bool Document::commitTransform(Interpolation interpolation, const std::string& label) {
+    if (!transform_) {
+        return false;
+    }
+    if (transform_->m.isIdentity()) {
+        cancelTransform();
+        return false;
+    }
+    TransformSession s = std::move(*transform_);
+    transform_.reset();
+    TiledImage& img = layers_[static_cast<std::size_t>(s.layer)].image;
+    restoreTiles(img, s.hole, s.previewArea);
+    transformInto(img, s.floating, s.m, interpolation);
+
+    std::size_t bytes = 0;
+    std::vector<TileChange> changes = diffTiles(s.before, img, bytes);
+    Command pixels = tileCommand(label, s.layer, false, std::move(changes), bytes);
+    const Selection selBefore = s.selectionBefore;
+    const Selection selAfter =
+        selBefore.isEmpty() ? selBefore : selBefore.transformed(s.m, interpolation);
     Command cmd{label,
-                [this, layer, changes] {
-                    for (const Change& c : changes) {
-                        layers_[static_cast<std::size_t>(layer)].image.setTile(c.tx, c.ty, c.before);
-                    }
+                [this, undoPixels = pixels.undo, selBefore] {
+                    undoPixels();
+                    selection_ = selBefore;
+                    ++selectionGeneration_;
                 },
-                [this, layer, changes] {
-                    for (const Change& c : changes) {
-                        layers_[static_cast<std::size_t>(layer)].image.setTile(c.tx, c.ty, c.after);
-                    }
+                [this, redoPixels = pixels.redo, selAfter] {
+                    redoPixels();
+                    selection_ = selAfter;
+                    ++selectionGeneration_;
                 }};
     cmd.bytes = bytes;
     execute(std::move(cmd));
+    return true;
+}
+
+void Document::cancelTransform() {
+    if (!transform_) {
+        return;
+    }
+    TiledImage& img = layers_[static_cast<std::size_t>(transform_->layer)].image;
+    restoreTiles(img, transform_->before, {0, 0, width_, height_});
+    transform_.reset();
+}
+
+bool Document::flipContent(bool horizontal) {
+    if (!beginTransform()) {
+        return false;
+    }
+    const IRect r = transformSourceRect();
+    const PointF centre{r.x + r.w / 2.0, r.y + r.h / 2.0};
+    setTransform(Affine::around(centre, horizontal ? Affine::scale(-1, 1) : Affine::scale(1, -1)));
+    return commitTransform(Interpolation::Nearest, horizontal ? "Flip Horizontal" : "Flip Vertical");
+}
+
+bool Document::rotateContent90(bool clockwise) {
+    if (!beginTransform()) {
+        return false;
+    }
+    const IRect r = transformSourceRect();
+    const PointF centre{r.x + r.w / 2.0, r.y + r.h / 2.0};
+    // Exact matrices (no trig rounding). With y pointing down, +90 degrees turns clockwise.
+    const Affine turn = clockwise ? Affine{0, 1, -1, 0, 0, 0} : Affine{0, -1, 1, 0, 0, 0};
+    Affine m = Affine::around(centre, turn);
+    // When w and h differ in parity the turned block would straddle pixels, so
+    // snap it to the grid. Integer division truncates toward zero, and since
+    // trunc(a) + trunc(-a) == 0, any two quarter turns cancel exactly (no drift).
+    const double exactLeft = centre.x - r.h / 2.0, exactTop = centre.y - r.w / 2.0;
+    const int left = r.x + (r.w - r.h) / 2, top = r.y + (r.h - r.w) / 2;
+    m = Affine::translate(left - exactLeft, top - exactTop) * m;
+    setTransform(m);
+    return commitTransform(Interpolation::Nearest, clockwise ? "Rotate 90° CW" : "Rotate 90° CCW");
+}
+
+// ---------------------------------------------------------------- canvas
+
+bool Document::crop(IRect area) {
+    area = area.intersected({0, 0, width_, height_});
+    if (busy() || area.empty() || area == IRect{0, 0, width_, height_}) {
+        return false;
+    }
+    std::vector<Layer> cropped;
+    cropped.reserve(layers_.size());
+    for (const Layer& l : layers_) {
+        Layer c{l.props, croppedImage(l.image, area), std::nullopt};
+        if (l.mask) {
+            c.mask = croppedImage(*l.mask, area);
+        }
+        cropped.push_back(std::move(c));
+    }
+    struct State {
+        int width, height;
+        std::vector<Layer> layers;
+        Selection selection;
+    };
+    auto before = std::make_shared<const State>(State{width_, height_, layers_, selection_});
+    auto after = std::make_shared<const State>(State{area.w, area.h, std::move(cropped), Selection(area.w, area.h)});
+    const auto apply = [this](const State& s) {
+        width_ = s.width;
+        height_ = s.height;
+        layers_ = s.layers;
+        selection_ = s.selection;
+        ++selectionGeneration_;
+        structureDirty_ = true;
+    };
+    execute({"Crop", [apply, before] { apply(*before); }, [apply, after] { apply(*after); }});
     return true;
 }
 
@@ -320,10 +749,11 @@ bool Document::compositeTile(int tx, int ty, TiledImage::Tile& out) const {
         if (!t) {
             continue;
         }
+        const TiledImage::Tile* m = (l.mask && l.props.maskEnabled) ? l.mask->tile(tx, ty) : nullptr;
         const bool opaqueLayer = l.props.opacity >= 1.0;
         if (!any) {
             any = true;
-            if (opaqueLayer) {
+            if (opaqueLayer && !m) {
                 out = *t;
                 continue;
             }
@@ -334,10 +764,18 @@ bool Document::compositeTile(int tx, int ty, TiledImage::Tile& out) const {
             if (s.a == 0) {
                 continue;
             }
-            if (s.a == 255 && opaqueLayer) {
+            double coverage = l.props.opacity;
+            if (m) {
+                const std::uint8_t mv = maskValue(m->pixels[i]);
+                if (mv == 0) {
+                    continue;
+                }
+                coverage *= mv / 255.0;
+            }
+            if (s.a == 255 && coverage >= 1.0) {
                 out.pixels[i] = s;
             } else {
-                out.pixels[i] = blendOver(out.pixels[i], s, l.props.opacity);
+                out.pixels[i] = blendOver(out.pixels[i], s, coverage);
             }
         }
     }
@@ -347,9 +785,14 @@ bool Document::compositeTile(int tx, int ty, TiledImage::Tile& out) const {
 Rgba8 Document::compositePixel(Point p) const {
     Rgba8 out = Rgba8::transparent();
     for (const Layer& l : layers_) {
-        if (l.props.visible && l.props.opacity > 0.0) {
-            out = blendOver(out, l.image.pixel(p), l.props.opacity);
+        if (!l.props.visible || l.props.opacity <= 0.0) {
+            continue;
         }
+        double coverage = l.props.opacity;
+        if (l.mask && l.props.maskEnabled) {
+            coverage *= maskValue(l.mask->pixel(p)) / 255.0;
+        }
+        out = blendOver(out, l.image.pixel(p), coverage);
     }
     return out;
 }
@@ -381,6 +824,11 @@ std::vector<Point> Document::takeDirtyTiles() {
     for (Layer& l : layers_) {
         for (const Point& t : l.image.takeDirtyTiles()) {
             seen[static_cast<std::size_t>(t.y * tx + t.x)] = true;
+        }
+        if (l.mask) {
+            for (const Point& t : l.mask->takeDirtyTiles()) {
+                seen[static_cast<std::size_t>(t.y * tx + t.x)] = true;
+            }
         }
     }
     if (structureDirty_) {

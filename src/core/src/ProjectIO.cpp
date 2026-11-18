@@ -29,6 +29,7 @@ constexpr std::uint32_t fourcc(const char (&s)[5]) {
 }
 constexpr std::uint32_t kChunkDoc = fourcc("DOCM");
 constexpr std::uint32_t kChunkLayer = fourcc("LAYR");
+constexpr std::uint32_t kChunkMask = fourcc("LMSK");
 constexpr std::uint32_t kChunkEnd = fourcc("END ");
 
 std::uint32_t crc32Of(const std::uint8_t* data, std::size_t size) {
@@ -129,6 +130,57 @@ std::vector<std::uint8_t> deflate(const void* data, std::size_t size) {
 
 LoadResult fail(std::string message) { return {nullptr, std::move(message)}; }
 
+// u32 tileCount, then per non-empty tile: u32 tx, u32 ty, u32 size, zlib data.
+bool writeTiles(ByteWriter& w, const TiledImage& image) {
+    ByteWriter tiles;
+    std::uint32_t count = 0;
+    for (int ty = 0; ty < image.tilesY(); ++ty) {
+        for (int tx = 0; tx < image.tilesX(); ++tx) {
+            const TiledImage::Tile* t = image.tile(tx, ty);
+            if (!t || isEmptyTile(*t)) {
+                continue;
+            }
+            const std::vector<std::uint8_t> packed = deflate(t->pixels.data(), kTileBytes);
+            if (packed.empty()) {
+                return false;
+            }
+            tiles.u32(static_cast<std::uint32_t>(tx));
+            tiles.u32(static_cast<std::uint32_t>(ty));
+            tiles.u32(static_cast<std::uint32_t>(packed.size()));
+            tiles.raw(packed.data(), packed.size());
+            ++count;
+        }
+    }
+    w.u32(count);
+    w.raw(tiles.bytes.data(), tiles.bytes.size());
+    return true;
+}
+
+// Returns an error message, or empty on success.
+std::string readTiles(ByteReader& r, TiledImage& image) {
+    const std::uint32_t count = r.u32();
+    for (std::uint32_t i = 0; i < count; ++i) {
+        const std::uint32_t tx = r.u32(), ty = r.u32(), packedSize = r.u32();
+        const std::uint8_t* packed = r.bytes(packedSize);
+        if (!r.ok()) {
+            return "Invalid tile record";
+        }
+        if (tx >= static_cast<std::uint32_t>(image.tilesX()) || ty >= static_cast<std::uint32_t>(image.tilesY())) {
+            return "Tile outside the canvas";
+        }
+        auto tile = std::make_shared<TiledImage::Tile>();
+        uLongf outSize = static_cast<uLongf>(kTileBytes);
+        if (uncompress(reinterpret_cast<Bytef*>(tile->pixels.data()), &outSize, packed,
+                       static_cast<uLong>(packedSize)) != Z_OK ||
+            outSize != kTileBytes) {
+            return "Corrupted tile data";
+        }
+        image.setTile(static_cast<int>(tx), static_cast<int>(ty), std::move(tile));
+    }
+    image.takeDirtyTiles();
+    return {};
+}
+
 } // namespace
 
 // ------------------------------------------------------------ atomic write
@@ -182,32 +234,23 @@ IoResult saveProject(const Document& doc, const fs::path& path) {
         lw.raw(name.data(), name.size());
         lw.u8(static_cast<std::uint8_t>((layer.props.visible ? 1 : 0) | (layer.props.locked ? 2 : 0)));
         lw.f32(static_cast<float>(layer.props.opacity));
-
-        ByteWriter tiles;
-        std::uint32_t tileCount = 0;
-        for (int ty = 0; ty < layer.image.tilesY(); ++ty) {
-            for (int tx = 0; tx < layer.image.tilesX(); ++tx) {
-                const TiledImage::Tile* t = layer.image.tile(tx, ty);
-                if (!t || isEmptyTile(*t)) {
-                    continue;
-                }
-                const std::vector<std::uint8_t> packed = deflate(t->pixels.data(), kTileBytes);
-                if (packed.empty()) {
-                    return {false, "Compression failed"};
-                }
-                tiles.u32(static_cast<std::uint32_t>(tx));
-                tiles.u32(static_cast<std::uint32_t>(ty));
-                tiles.u32(static_cast<std::uint32_t>(packed.size()));
-                tiles.raw(packed.data(), packed.size());
-                ++tileCount;
-            }
+        if (!writeTiles(lw, layer.image)) {
+            return {false, "Compression failed"};
         }
-        lw.u32(tileCount);
-        lw.raw(tiles.bytes.data(), tiles.bytes.size());
         if (lw.bytes.size() > 0xFFFFFFFFull) {
             return {false, "Layer \"" + name + "\" is too large to save"};
         }
         w.chunk(kChunkLayer, lw);
+
+        if (layer.mask) {
+            ByteWriter mw;
+            mw.u32(static_cast<std::uint32_t>(i));
+            mw.u8(layer.props.maskEnabled ? 1 : 0);
+            if (!writeTiles(mw, *layer.mask)) {
+                return {false, "Compression failed"};
+            }
+            w.chunk(kChunkMask, mw);
+        }
     }
     w.chunk(kChunkEnd, ByteWriter{});
     w.u32(crc32Of(w.bytes.data(), w.bytes.size()));
@@ -280,12 +323,11 @@ LoadResult loadProject(const fs::path& path) {
             if (!haveHeader || layers.size() >= expectedLayers) {
                 return fail("Unexpected layer data");
             }
-            Layer layer{{}, TiledImage(width, height)};
+            Layer layer{{}, TiledImage(width, height), std::nullopt};
             const std::uint16_t nameLength = c.u16();
             const std::uint8_t* name = c.bytes(nameLength);
             const std::uint8_t flags = c.u8();
             const float opacity = c.f32();
-            const std::uint32_t tileCount = c.u32();
             if (!c.ok()) {
                 return fail("Invalid layer record");
             }
@@ -293,28 +335,22 @@ LoadResult loadProject(const fs::path& path) {
             layer.props.visible = (flags & 1) != 0;
             layer.props.locked = (flags & 2) != 0;
             layer.props.opacity = std::isfinite(opacity) ? std::clamp(static_cast<double>(opacity), 0.0, 1.0) : 1.0;
-
-            for (std::uint32_t i = 0; i < tileCount; ++i) {
-                const std::uint32_t tx = c.u32(), ty = c.u32(), packedSize = c.u32();
-                const std::uint8_t* packed = c.bytes(packedSize);
-                if (!c.ok()) {
-                    return fail("Invalid tile record");
-                }
-                if (tx >= static_cast<std::uint32_t>(layer.image.tilesX()) ||
-                    ty >= static_cast<std::uint32_t>(layer.image.tilesY())) {
-                    return fail("Tile outside the canvas");
-                }
-                auto tile = std::make_shared<TiledImage::Tile>();
-                uLongf outSize = static_cast<uLongf>(kTileBytes);
-                if (uncompress(reinterpret_cast<Bytef*>(tile->pixels.data()), &outSize, packed,
-                               static_cast<uLong>(packedSize)) != Z_OK ||
-                    outSize != kTileBytes) {
-                    return fail("Corrupted tile data");
-                }
-                layer.image.setTile(static_cast<int>(tx), static_cast<int>(ty), std::move(tile));
+            if (std::string error = readTiles(c, layer.image); !error.empty()) {
+                return fail(error);
             }
-            layer.image.takeDirtyTiles();
             layers.push_back(std::move(layer));
+        } else if (tag == kChunkMask) {
+            const std::uint32_t index = c.u32();
+            const std::uint8_t flags = c.u8();
+            if (!c.ok() || index >= layers.size() || layers[index].mask) {
+                return fail("Invalid layer mask");
+            }
+            TiledImage mask(width, height);
+            if (std::string error = readTiles(c, mask); !error.empty()) {
+                return fail(error);
+            }
+            layers[index].mask = std::move(mask);
+            layers[index].props.maskEnabled = (flags & 1) != 0;
         } else if (tag == kChunkEnd) {
             haveEnd = true;
         }

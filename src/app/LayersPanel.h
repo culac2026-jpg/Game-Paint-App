@@ -13,7 +13,8 @@ class QSpinBox;
 class QToolButton;
 
 // Layer list (top layer first) with visibility checkboxes, inline rename,
-// opacity, lock, and add / duplicate / delete / reorder buttons. Every change
+// opacity, lock, add / duplicate / delete / reorder buttons, and layer-mask
+// controls. Every change
 // goes through gas::Document so it is undoable.
 class LayersPanel : public QWidget {
     Q_OBJECT
@@ -37,6 +38,7 @@ private:
     void setOpacity(int percent);
     void setLocked(bool locked);
     void moveActive(int delta);
+    void setMaskEnabled(bool enabled);
 
     gas::Document* document_ = nullptr;
     QListWidget* list_ = nullptr;
@@ -47,4 +49,10 @@ private:
     QToolButton* deleteButton_ = nullptr;
     QToolButton* upButton_ = nullptr;
     QToolButton* downButton_ = nullptr;
+    // Layer mask row
+    QToolButton* addMaskButton_ = nullptr;
+    QCheckBox* editMask_ = nullptr;
+    QCheckBox* maskEnabled_ = nullptr;
+    QToolButton* applyMaskButton_ = nullptr;
+    QToolButton* removeMaskButton_ = nullptr;
 };

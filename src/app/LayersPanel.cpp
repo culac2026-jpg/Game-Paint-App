@@ -29,7 +29,9 @@ QToolButton* makeButton(QWidget* parent, const QString& text, const QString& tip
 LayersPanel::LayersPanel(QWidget* parent) : QWidget(parent) {
     list_ = new QListWidget(this);
     list_->setSelectionMode(QAbstractItemView::SingleSelection);
-    list_->setEditTriggers(QAbstractItemView::DoubleClicked | QAbstractItemView::EditKeyPressed);
+    list_->setEditTriggers(QAbstractItemView::DoubleClicked);
+    // Keyboard focus would turn single-key tool shortcuts into item searches.
+    list_->setFocusPolicy(Qt::NoFocus);
 
     opacity_ = new QSpinBox(this);
     opacity_->setRange(0, 100);
@@ -59,11 +61,30 @@ LayersPanel::LayersPanel(QWidget* parent) : QWidget(parent) {
     buttons->addWidget(upButton_);
     buttons->addWidget(downButton_);
 
+    addMaskButton_ = makeButton(this, tr("Add Mask"),
+                                tr("Add a layer mask (from the selection if there is one)"));
+    editMask_ = new QCheckBox(tr("Edit mask"), this);
+    editMask_->setFocusPolicy(Qt::NoFocus);
+    editMask_->setToolTip(tr("Paint on the mask: black hides, white or erasing shows"));
+    maskEnabled_ = new QCheckBox(tr("On"), this);
+    maskEnabled_->setFocusPolicy(Qt::NoFocus);
+    maskEnabled_->setToolTip(tr("Enable or disable the mask without deleting it"));
+    applyMaskButton_ = makeButton(this, tr("Apply"), tr("Bake the mask into the layer's transparency"));
+    removeMaskButton_ = makeButton(this, tr("Remove"), tr("Delete the mask"));
+    auto* maskRow = new QHBoxLayout;
+    maskRow->addWidget(addMaskButton_);
+    maskRow->addWidget(editMask_);
+    maskRow->addWidget(maskEnabled_);
+    maskRow->addStretch();
+    maskRow->addWidget(applyMaskButton_);
+    maskRow->addWidget(removeMaskButton_);
+
     auto* layout = new QVBoxLayout(this);
     layout->setContentsMargins(4, 4, 4, 4);
     layout->addLayout(props);
     layout->addWidget(list_, 1);
     layout->addLayout(buttons);
+    layout->addLayout(maskRow);
 
     connect(list_, &QListWidget::itemChanged, this, &LayersPanel::onItemChanged);
     connect(list_, &QListWidget::currentRowChanged, this, &LayersPanel::onCurrentRowChanged);
@@ -85,6 +106,26 @@ LayersPanel::LayersPanel(QWidget* parent) : QWidget(parent) {
     });
     connect(upButton_, &QToolButton::clicked, this, [this] { moveActive(+1); });
     connect(downButton_, &QToolButton::clicked, this, [this] { moveActive(-1); });
+    connect(addMaskButton_, &QToolButton::clicked, this, [this] {
+        if (document_->addLayerMask(document_->activeLayerIndex())) {
+            Q_EMIT documentChanged();
+        }
+    });
+    connect(editMask_, &QCheckBox::toggled, this, [this](bool on) {
+        document_->setEditingMask(on);
+        Q_EMIT documentChanged();
+    });
+    connect(maskEnabled_, &QCheckBox::toggled, this, &LayersPanel::setMaskEnabled);
+    connect(applyMaskButton_, &QToolButton::clicked, this, [this] {
+        if (document_->applyLayerMask(document_->activeLayerIndex())) {
+            Q_EMIT documentChanged();
+        }
+    });
+    connect(removeMaskButton_, &QToolButton::clicked, this, [this] {
+        if (document_->removeLayerMask(document_->activeLayerIndex())) {
+            Q_EMIT documentChanged();
+        }
+    });
 
     setEnabled(false);
 }
@@ -106,11 +147,20 @@ void LayersPanel::refresh() {
         return;
     }
     for (int row = 0; row < document_->layerCount(); ++row) {
-        const gas::LayerProps& p = document_->layer(rowToIndex(row)).props;
+        const gas::Layer& layer = document_->layer(rowToIndex(row));
+        const gas::LayerProps& p = layer.props;
         auto* item = new QListWidgetItem(QString::fromStdString(p.name), list_);
+        if (layer.mask) {
+            // Masked layers are tinted blue (the name itself stays plain for renaming).
+            item->setData(Qt::ToolTipRole, tr("Has a layer mask%1. Double-click to rename.")
+                                               .arg(p.maskEnabled ? QString() : tr(" (disabled)")));
+        }
         item->setFlags(Qt::ItemIsSelectable | Qt::ItemIsEnabled | Qt::ItemIsUserCheckable | Qt::ItemIsEditable);
         item->setCheckState(p.visible ? Qt::Checked : Qt::Unchecked);
-        item->setToolTip(tr("Double-click to rename; checkbox toggles visibility"));
+        if (!layer.mask) {
+            item->setToolTip(tr("Double-click to rename; checkbox toggles visibility"));
+        }
+        item->setForeground(layer.mask && p.maskEnabled ? QBrush(QColor(0x3d, 0x8b, 0xd6)) : QBrush());
         QFont font = item->font();
         font.setItalic(p.locked); // locked layers read differently at a glance
         item->setFont(font);
@@ -124,6 +174,18 @@ void LayersPanel::refresh() {
         opacity_->setValue(static_cast<int>(std::lround(p.opacity * 100.0)));
         lock_->setChecked(p.locked);
     }
+    const bool hasMask = document_->activeLayer().mask.has_value();
+    {
+        const QSignalBlocker b3(editMask_), b4(maskEnabled_);
+        editMask_->setChecked(document_->editingMask());
+        maskEnabled_->setChecked(hasMask && p.maskEnabled);
+    }
+    addMaskButton_->setEnabled(!hasMask);
+    editMask_->setEnabled(hasMask);
+    maskEnabled_->setEnabled(hasMask);
+    applyMaskButton_->setEnabled(hasMask);
+    removeMaskButton_->setEnabled(hasMask);
+
     const int count = document_->layerCount();
     deleteButton_->setEnabled(count > 1);
     duplicateButton_->setEnabled(count < gas::Document::kMaxLayers);
@@ -171,6 +233,14 @@ void LayersPanel::setLocked(bool locked) {
 void LayersPanel::moveActive(int delta) {
     const int from = document_->activeLayerIndex();
     if (document_->moveLayer(from, from + delta)) {
+        Q_EMIT documentChanged();
+    }
+}
+
+void LayersPanel::setMaskEnabled(bool enabled) {
+    gas::LayerProps p = document_->activeLayer().props;
+    p.maskEnabled = enabled;
+    if (document_->setLayerProps(document_->activeLayerIndex(), p)) {
         Q_EMIT documentChanged();
     }
 }

@@ -12,6 +12,8 @@ class Document;
 
 class LayersPanel;
 class QAction;
+class QCheckBox;
+class QComboBox;
 class QLabel;
 class QSpinBox;
 class QToolButton;
@@ -49,6 +51,11 @@ private:
 
     void undo();
     void redo();
+    // Commits a pending free transform so file/menu commands see final pixels.
+    void settleCanvas();
+    // Refreshes the views if a document command changed anything.
+    void runCommand(bool changed);
+    void cropToSelection();
     // Re-syncs every view of the document (title, undo actions, layers, canvas).
     void onDocumentChanged();
 
@@ -64,6 +71,7 @@ private:
     QLabel* cursorLabel_ = nullptr;
     QAction* undoAction_ = nullptr;
     QAction* redoAction_ = nullptr;
+    QList<QAction*> documentActions_; // disabled while a transform is open
 
     QToolButton* colorButton_ = nullptr;
     QSpinBox* sizeBox_ = nullptr;
@@ -72,4 +80,10 @@ private:
     QSpinBox* toleranceBox_ = nullptr;
     QList<QAction*> brushOptionActions_; // shown for Brush / Eraser
     QList<QAction*> fillOptionActions_;  // shown for Fill
+    QComboBox* selectionModeBox_ = nullptr;
+    QCheckBox* antialiasBox_ = nullptr;
+    QList<QAction*> selectionOptionActions_; // shown for selection tools
+    QComboBox* interpolationBox_ = nullptr;
+    QList<QAction*> transformOptionActions_; // shown for Move / while transforming
+    QList<QAction*> transformApplyActions_;  // shown while transforming
 };

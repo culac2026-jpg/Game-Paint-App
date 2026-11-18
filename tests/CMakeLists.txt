@@ -19,6 +19,8 @@ add_executable(gas_core_tests
     FillTest.cpp
     DocumentTest.cpp
     ProjectIOTest.cpp
+    SelectionTest.cpp
+    SelectionEditTest.cpp
 )
 find_package(ZLIB REQUIRED) # the PNG test decodes with zlib directly
 target_link_libraries(gas_core_tests PRIVATE gas::core gas_warnings GTest::gtest_main ZLIB::ZLIB)

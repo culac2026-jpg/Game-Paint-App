@@ -7,6 +7,8 @@ add_library(gas_core STATIC
     src/Brush.cpp
     src/Fill.cpp
     src/ProjectIO.cpp
+    src/Selection.cpp
+    src/Transform.cpp
 )
 add_library(gas::core ALIAS gas_core)
 
