@@ -1,5 +1,6 @@
 #include "MainWindow.h"
 
+#include "BrushPanel.h"
 #include "LayersPanel.h"
 
 #include <gas/core/Document.h>
@@ -21,6 +22,7 @@
 #include <QMessageBox>
 #include <QPainter>
 #include <QPixmap>
+#include <QScrollArea>
 #include <QSignalBlocker>
 #include <QSpinBox>
 #include <QStatusBar>
@@ -311,6 +313,9 @@ void MainWindow::syncToolOptions() {
         opacityBox_->setValue(percent(s.opacity));
         hardnessBox_->setValue(percent(s.hardness));
     }
+    if (brushPanel_) {
+        brushPanel_->refresh();
+    }
     const QSignalBlocker b4(toleranceBox_);
     toleranceBox_->setValue(canvas_->fillTolerance());
 }
@@ -366,6 +371,22 @@ void MainWindow::createDocks() {
     dock->setWidget(layersPanel_);
     dock->setMinimumWidth(220);
     addDockWidget(Qt::RightDockWidgetArea, dock);
+    brushPanel_ = new BrushPanel(canvas_, this);
+    auto* brushDock = new QDockWidget(tr("Brush"), this);
+    brushDock->setObjectName(QStringLiteral("brushDock"));
+    brushDock->setFeatures(QDockWidget::DockWidgetMovable | QDockWidget::DockWidgetFloatable);
+    auto* brushScroll = new QScrollArea(brushDock);
+    brushScroll->setWidget(brushPanel_);
+    brushScroll->setWidgetResizable(true);
+    brushScroll->setFrameShape(QFrame::NoFrame);
+    brushDock->setWidget(brushScroll);
+    addDockWidget(Qt::RightDockWidgetArea, brushDock);
+    resizeDocks({dock, brushDock}, {420, 300}, Qt::Vertical); // keep the layer list roomy
+    connect(brushPanel_, &BrushPanel::settingsChanged, this, [this] {
+        syncToolOptions(); // a preset may change size / opacity / hardness
+        canvas_->update(); // brush outline
+    });
+
     // Queued: the panel's own item signals must finish before it rebuilds its list.
     connect(layersPanel_, &LayersPanel::documentChanged, this, &MainWindow::onDocumentChanged,
             Qt::QueuedConnection);

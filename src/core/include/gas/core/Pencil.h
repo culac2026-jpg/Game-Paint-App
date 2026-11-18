@@ -20,8 +20,8 @@ public:
     void setColor(Rgba8 color) { color_ = color; }
     Rgba8 color() const { return color_; }
 
-    void begin(TiledImage& image, PointF p) override;
-    void moveTo(TiledImage& image, PointF p) override;
+    void begin(TiledImage& image, PointF p, double pressure = 1.0) override;
+    void moveTo(TiledImage& image, PointF p, double pressure = 1.0) override;
     void end() override;
     bool isStroking() const override { return last_.has_value(); }
 

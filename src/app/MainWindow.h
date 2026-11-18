@@ -10,6 +10,7 @@ namespace gas {
 class Document;
 }
 
+class BrushPanel;
 class LayersPanel;
 class QAction;
 class QCheckBox;
@@ -67,6 +68,7 @@ private:
     QString filePath_; // empty until saved/opened
     CanvasWidget* canvas_ = nullptr;
     LayersPanel* layersPanel_ = nullptr;
+    BrushPanel* brushPanel_ = nullptr;
     QLabel* zoomLabel_ = nullptr;
     QLabel* cursorLabel_ = nullptr;
     QAction* undoAction_ = nullptr;

@@ -30,6 +30,7 @@ constexpr std::uint32_t fourcc(const char (&s)[5]) {
 constexpr std::uint32_t kChunkDoc = fourcc("DOCM");
 constexpr std::uint32_t kChunkLayer = fourcc("LAYR");
 constexpr std::uint32_t kChunkMask = fourcc("LMSK");
+constexpr std::uint32_t kChunkLayerProps = fourcc("LPRP");
 constexpr std::uint32_t kChunkEnd = fourcc("END ");
 
 std::uint32_t crc32Of(const std::uint8_t* data, std::size_t size) {
@@ -251,6 +252,12 @@ IoResult saveProject(const Document& doc, const fs::path& path) {
             }
             w.chunk(kChunkMask, mw);
         }
+        if (layer.props.blendMode != BlendMode::Normal) {
+            ByteWriter pw;
+            pw.u32(static_cast<std::uint32_t>(i));
+            pw.u8(static_cast<std::uint8_t>(layer.props.blendMode));
+            w.chunk(kChunkLayerProps, pw);
+        }
     }
     w.chunk(kChunkEnd, ByteWriter{});
     w.u32(crc32Of(w.bytes.data(), w.bytes.size()));
@@ -351,6 +358,13 @@ LoadResult loadProject(const fs::path& path) {
             }
             layers[index].mask = std::move(mask);
             layers[index].props.maskEnabled = (flags & 1) != 0;
+        } else if (tag == kChunkLayerProps) {
+            const std::uint32_t index = c.u32();
+            const std::uint8_t mode = c.u8();
+            if (!c.ok() || index >= layers.size()) {
+                return fail("Invalid layer properties");
+            }
+            layers[index].props.blendMode = mode < kBlendModeCount ? static_cast<BlendMode>(mode) : BlendMode::Normal;
         } else if (tag == kChunkEnd) {
             haveEnd = true;
         }

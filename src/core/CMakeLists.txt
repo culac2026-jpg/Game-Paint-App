@@ -5,6 +5,7 @@ add_library(gas_core STATIC
     src/Document.cpp
     src/Blend.cpp
     src/Brush.cpp
+    src/BrushPresets.cpp
     src/Fill.cpp
     src/ProjectIO.cpp
     src/Selection.cpp

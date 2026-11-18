@@ -3,6 +3,7 @@
 #include <gas/core/Brush.h>
 #include <gas/core/Pencil.h>
 #include <gas/core/Selection.h>
+#include <gas/core/StrokeSmoother.h>
 #include <gas/core/Viewport.h>
 
 #include <QHash>
@@ -92,6 +93,7 @@ protected:
     void keyPressEvent(QKeyEvent* event) override;
     void keyReleaseEvent(QKeyEvent* event) override;
     void leaveEvent(QEvent* event) override;
+    void tabletEvent(QTabletEvent* event) override;
 
 private:
     // Free-transform parameters: M = T(centre + offset) * R(angle) * S(sx, sy) * T(-centre).
@@ -115,6 +117,8 @@ private:
     void finishSelectionDrag(bool shift, bool alt);
     gas::Point pixelAt(QPointF widgetPos) const;
     gas::PointF docAt(QPointF widgetPos) const;
+    // Pen pressure for a mouse event synthesized from a tablet, else 1.
+    double pressureOf(const QMouseEvent* event) const;
     void pickColorAt(QPointF widgetPos);
     void cacheTile(int tx, int ty);
     void syncDirtyTiles();
@@ -147,6 +151,8 @@ private:
     gas::BrushTool eraser_{gas::BrushMode::Erase};
     int fillTolerance_ = 0;
     bool picking_ = false;
+    gas::StrokeSmoother smoother_;
+    double tabletPressure_ = 1.0; // from the latest tablet event
 
     // Selection tools
     gas::Selection::Op selectionOp_ = gas::Selection::Op::Replace;

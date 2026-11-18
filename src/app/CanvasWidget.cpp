@@ -9,6 +9,7 @@
 #include <QPainterPath>
 #include <QPixmap>
 #include <QPolygonF>
+#include <QTabletEvent>
 #include <QWheelEvent>
 
 #include <algorithm>
@@ -121,6 +122,10 @@ void CanvasWidget::finishStroke() {
         return;
     }
     if (gas::StrokeTool* active = strokeTool()) {
+        // The stabilizer lags behind the pointer; finish at the release point.
+        if (const auto tail = smoother_.finish()) {
+            active->moveTo(*editImage_, tail->pos, tail->pressure);
+        }
         active->end();
     }
     editImage_ = nullptr;
@@ -407,6 +412,20 @@ gas::Point CanvasWidget::pixelAt(QPointF widgetPos) const { return gas::toPixel(
 
 gas::PointF CanvasWidget::docAt(QPointF widgetPos) const { return viewport_.screenToDoc(fromQt(widgetPos)); }
 
+double CanvasWidget::pressureOf(const QMouseEvent* event) const {
+    const QPointingDevice* device = event->pointingDevice();
+    const bool pen = device && (device->type() == QInputDevice::DeviceType::Stylus ||
+                                device->type() == QInputDevice::DeviceType::Airbrush);
+    return pen ? tabletPressure_ : 1.0;
+}
+
+// Tablet events are only used for their pressure: ignoring them makes Qt
+// deliver the same input as mouse events, which drive every tool.
+void CanvasWidget::tabletEvent(QTabletEvent* event) {
+    tabletPressure_ = std::clamp(event->pressure(), 0.0, 1.0);
+    event->ignore();
+}
+
 // Samples the composite of all visible layers, ignoring fully transparent pixels.
 void CanvasWidget::pickColorAt(QPointF widgetPos) {
     const gas::Point p = pixelAt(widgetPos);
@@ -659,7 +678,10 @@ void CanvasWidget::mousePressEvent(QMouseEvent* event) {
     default:
         if (gas::TiledImage* img = beginEdit()) {
             editImage_ = img;
-            strokeTool()->begin(*img, docAt(event->position()));
+            const bool brushLike = tool_ == Tool::Brush || tool_ == Tool::Eraser;
+            smoother_.setSmoothing(brushLike ? brushSettings(tool_).smoothing : 0.0);
+            const gas::StrokeSample s = smoother_.begin({docAt(event->position()), pressureOf(event)});
+            strokeTool()->begin(*img, s.pos, s.pressure);
             document_->syncEdit();
         }
         break;
@@ -699,7 +721,8 @@ void CanvasWidget::mouseMoveEvent(QMouseEvent* event) {
     } else if (picking_ && document_) {
         pickColorAt(event->position());
     } else if (editImage_) {
-        strokeTool()->moveTo(*editImage_, docAt(event->position()));
+        const gas::StrokeSample s = smoother_.add({docAt(event->position()), pressureOf(event)});
+        strokeTool()->moveTo(*editImage_, s.pos, s.pressure);
         document_->syncEdit(); // push the clipped result into the layer for display
     }
     update(); // also repaints the brush outline

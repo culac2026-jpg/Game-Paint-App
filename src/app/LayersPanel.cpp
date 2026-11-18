@@ -3,6 +3,7 @@
 #include <gas/core/Document.h>
 
 #include <QCheckBox>
+#include <QComboBox>
 #include <QHBoxLayout>
 #include <QLabel>
 #include <QListWidget>
@@ -41,6 +42,16 @@ LayersPanel::LayersPanel(QWidget* parent) : QWidget(parent) {
     lock_ = new QCheckBox(tr("Lock"), this);
     lock_->setFocusPolicy(Qt::NoFocus);
     lock_->setToolTip(tr("Prevent painting on this layer"));
+
+    blendMode_ = new QComboBox(this);
+    blendMode_->setFocusPolicy(Qt::NoFocus);
+    blendMode_->setToolTip(tr("How this layer mixes with the layers below"));
+    for (int m = 0; m < gas::kBlendModeCount; ++m) {
+        blendMode_->addItem(tr(gas::blendModeName(static_cast<gas::BlendMode>(m)).data()), m);
+    }
+    auto* blendRow = new QHBoxLayout;
+    blendRow->addWidget(new QLabel(tr("Blend"), this));
+    blendRow->addWidget(blendMode_, 1);
 
     auto* props = new QHBoxLayout;
     props->addWidget(new QLabel(tr("Opacity"), this));
@@ -81,6 +92,7 @@ LayersPanel::LayersPanel(QWidget* parent) : QWidget(parent) {
 
     auto* layout = new QVBoxLayout(this);
     layout->setContentsMargins(4, 4, 4, 4);
+    layout->addLayout(blendRow);
     layout->addLayout(props);
     layout->addWidget(list_, 1);
     layout->addLayout(buttons);
@@ -90,6 +102,7 @@ LayersPanel::LayersPanel(QWidget* parent) : QWidget(parent) {
     connect(list_, &QListWidget::currentRowChanged, this, &LayersPanel::onCurrentRowChanged);
     connect(opacity_, &QSpinBox::valueChanged, this, &LayersPanel::setOpacity);
     connect(lock_, &QCheckBox::toggled, this, &LayersPanel::setLocked);
+    connect(blendMode_, &QComboBox::currentIndexChanged, this, &LayersPanel::setBlendMode);
     connect(addButton_, &QToolButton::clicked, this, [this] {
         document_->addLayer();
         Q_EMIT documentChanged();
@@ -170,9 +183,10 @@ void LayersPanel::refresh() {
 
     const gas::LayerProps& p = document_->activeLayer().props;
     {
-        const QSignalBlocker b1(opacity_), b2(lock_);
+        const QSignalBlocker b1(opacity_), b2(lock_), b5(blendMode_);
         opacity_->setValue(static_cast<int>(std::lround(p.opacity * 100.0)));
         lock_->setChecked(p.locked);
+        blendMode_->setCurrentIndex(static_cast<int>(p.blendMode));
     }
     const bool hasMask = document_->activeLayer().mask.has_value();
     {
@@ -233,6 +247,14 @@ void LayersPanel::setLocked(bool locked) {
 void LayersPanel::moveActive(int delta) {
     const int from = document_->activeLayerIndex();
     if (document_->moveLayer(from, from + delta)) {
+        Q_EMIT documentChanged();
+    }
+}
+
+void LayersPanel::setBlendMode(int comboIndex) {
+    gas::LayerProps p = document_->activeLayer().props;
+    p.blendMode = static_cast<gas::BlendMode>(blendMode_->itemData(comboIndex).toInt());
+    if (document_->setLayerProps(document_->activeLayerIndex(), p)) {
         Q_EMIT documentChanged();
     }
 }

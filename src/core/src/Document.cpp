@@ -751,8 +751,10 @@ bool Document::compositeTile(int tx, int ty, TiledImage::Tile& out) const {
         }
         const TiledImage::Tile* m = (l.mask && l.props.maskEnabled) ? l.mask->tile(tx, ty) : nullptr;
         const bool opaqueLayer = l.props.opacity >= 1.0;
+        const BlendMode mode = l.props.blendMode;
         if (!any) {
             any = true;
+            // Nothing below yet, so every blend mode reduces to a plain copy.
             if (opaqueLayer && !m) {
                 out = *t;
                 continue;
@@ -772,7 +774,9 @@ bool Document::compositeTile(int tx, int ty, TiledImage::Tile& out) const {
                 }
                 coverage *= mv / 255.0;
             }
-            if (s.a == 255 && coverage >= 1.0) {
+            if (mode != BlendMode::Normal) {
+                out.pixels[i] = blendPixel(out.pixels[i], s, mode, coverage);
+            } else if (s.a == 255 && coverage >= 1.0) {
                 out.pixels[i] = s;
             } else {
                 out.pixels[i] = blendOver(out.pixels[i], s, coverage);
@@ -792,7 +796,7 @@ Rgba8 Document::compositePixel(Point p) const {
         if (l.mask && l.props.maskEnabled) {
             coverage *= maskValue(l.mask->pixel(p)) / 255.0;
         }
-        out = blendOver(out, l.image.pixel(p), coverage);
+        out = blendPixel(out, l.image.pixel(p), l.props.blendMode, coverage);
     }
     return out;
 }

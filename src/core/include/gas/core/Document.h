@@ -1,5 +1,6 @@
 #pragma once
 
+#include "gas/core/Blend.h"
 #include "gas/core/Selection.h"
 #include "gas/core/TiledImage.h"
 #include "gas/core/Transform.h"
@@ -20,6 +21,7 @@ struct LayerProps {
     bool locked = false;
     double opacity = 1.0;    // 0..1
     bool maskEnabled = true; // ignored when the layer has no mask
+    BlendMode blendMode = BlendMode::Normal;
 
     friend bool operator==(const LayerProps&, const LayerProps&) = default;
 };

@@ -22,6 +22,9 @@ class Document;
 //            f32 opacity, TILES
 //     "LMSK" (version 2+) optional, after its layer: u32 layerIndex,
 //            u8 flags (1 = mask enabled), TILES
+//     "LPRP" (version 3+) optional, after its layer: u32 layerIndex,
+//            u8 blendMode (BlendMode value; unknown = Normal); readers
+//            ignore any further bytes, so fields can be appended
 //     "END "
 //   u32 CRC-32 of every preceding byte
 //
@@ -31,9 +34,9 @@ class Document;
 // Only non-empty tiles are stored. Saves are atomic: written to a temporary
 // sibling file, then renamed over the target, so a failed save never damages
 // an existing file. Undo history and the selection are not saved.
-// Version history: 1 = v0.3 (layers), 2 = v0.4 (layer masks). Older versions
+// Version history: 1 = v0.3 (layers), 2 = v0.4 (layer masks), 3 = v0.5 (blend modes). Older versions
 // still load; newer ones are refused.
-inline constexpr std::uint32_t kProjectFormatVersion = 2;
+inline constexpr std::uint32_t kProjectFormatVersion = 3;
 inline constexpr const char* kProjectExtension = ".gas";
 
 struct IoResult {

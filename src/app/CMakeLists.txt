@@ -9,6 +9,8 @@ qt_add_executable(GameArtStudio WIN32
     CanvasWidget.cpp
     LayersPanel.h
     LayersPanel.cpp
+    BrushPanel.h
+    BrushPanel.cpp
 )
 
 target_compile_definitions(GameArtStudio PRIVATE

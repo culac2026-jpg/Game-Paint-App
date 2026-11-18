@@ -7,6 +7,7 @@ class Document;
 }
 
 class QCheckBox;
+class QComboBox;
 class QListWidget;
 class QListWidgetItem;
 class QSpinBox;
@@ -37,6 +38,7 @@ private:
     void onCurrentRowChanged(int row);
     void setOpacity(int percent);
     void setLocked(bool locked);
+    void setBlendMode(int comboIndex);
     void moveActive(int delta);
     void setMaskEnabled(bool enabled);
 
@@ -44,6 +46,7 @@ private:
     QListWidget* list_ = nullptr;
     QSpinBox* opacity_ = nullptr;
     QCheckBox* lock_ = nullptr;
+    QComboBox* blendMode_ = nullptr;
     QToolButton* addButton_ = nullptr;
     QToolButton* duplicateButton_ = nullptr;
     QToolButton* deleteButton_ = nullptr;
