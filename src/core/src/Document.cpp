@@ -113,6 +113,7 @@ TiledImage croppedImage(const TiledImage& src, IRect area) {
 Document::Document(int width, int height) : width_(width), height_(height), selection_(width, height) {
     checkSize(width, height);
     layers_.emplace_back(namedProps(nextLayerName()), TiledImage(width, height));
+    normalizeLayer(layers_.back());
     ++createdLayers_;
 }
 
@@ -130,6 +131,10 @@ Document::Document(int width, int height, std::vector<Layer> layers, int activeL
     }
     activeLayer_ = std::clamp(activeLayer, 0, layerCount() - 1);
     createdLayers_ = layerCount();
+    for (Layer& l : layers_) {
+        l.cels.clear(); // loaders add frames with restoreAnimation()
+        normalizeLayer(l);
+    }
 }
 
 Document::~Document() = default;
@@ -150,7 +155,12 @@ TiledImage& Document::targetImage(int layer, bool mask) {
 // ---------------------------------------------------------------- history
 
 void Document::execute(Command cmd) {
+    if (!cmd.animationState) {
+        cmd.frame = activeFrame_;
+    }
     cmd.redo();
+    syncCels();
+    ++historyGeneration_;
     const bool atCleanState = cleanIndex_ == static_cast<long long>(undo_.size());
     const bool hadRedo = !redo_.empty();
     redo_.clear();
@@ -207,7 +217,12 @@ bool Document::undo() {
     }
     Command cmd = std::move(undo_.back());
     undo_.pop_back();
+    if (cmd.frame >= 0 && cmd.frame != activeFrame_ && cmd.frame < frameCount()) {
+        switchFrame(cmd.frame);
+    }
     cmd.undo();
+    syncCels();
+    ++historyGeneration_;
     redo_.push_back(std::move(cmd));
     return true;
 }
@@ -218,7 +233,12 @@ bool Document::redo() {
     }
     Command cmd = std::move(redo_.back());
     redo_.pop_back();
+    if (cmd.frame >= 0 && cmd.frame != activeFrame_ && cmd.frame < frameCount()) {
+        switchFrame(cmd.frame);
+    }
     cmd.redo();
+    syncCels();
+    ++historyGeneration_;
     undo_.push_back(std::move(cmd));
     return true;
 }
@@ -236,6 +256,7 @@ void Document::addLayer() {
     const int index = activeLayer_ + 1;
     const int prevActive = activeLayer_;
     Layer layer(namedProps(nextLayerName()), TiledImage(width_, height_));
+    normalizeLayer(layer);
     ++createdLayers_;
     execute({"New Layer",
              [this, index, prevActive] {
@@ -258,6 +279,7 @@ bool Document::addLayer(const std::string& name, TiledImage image, const std::st
     const int index = activeLayer_ + 1;
     const int prevActive = activeLayer_;
     Layer layer(namedProps(name.empty() ? nextLayerName() : name), std::move(image));
+    normalizeLayer(layer);
     ++createdLayers_;
     execute({label,
              [this, index, prevActive] {
@@ -369,6 +391,8 @@ bool Document::setLayerProps(int index, const LayerProps& props) {
 }
 
 void Document::replaceLayer(int index, Layer after, const std::string& label) {
+    after.cels.resize(frames_.size(), TiledImage(width_, height_));
+    after.cels[static_cast<std::size_t>(activeFrame_)] = after.image;
     const Layer before = layers_[static_cast<std::size_t>(index)];
     execute({label,
              [this, index, before] {
@@ -434,19 +458,22 @@ bool Document::applyLayerMask(int index) {
     }
     Layer after = layers_[static_cast<std::size_t>(index)];
     if (after.props.maskEnabled) {
-        for (int ty = 0; ty < after.image.tilesY(); ++ty) {
-            for (int tx = 0; tx < after.image.tilesX(); ++tx) {
-                const TiledImage::Tile* m = after.mask->tile(tx, ty);
-                if (!m || !after.image.tile(tx, ty)) {
-                    continue; // unpainted mask = fully shown; empty layer tile stays empty
-                }
-                TiledImage::Tile& t = after.image.editTile(tx, ty);
-                for (std::size_t i = 0; i < t.pixels.size(); ++i) {
-                    t.pixels[i] = eraseAlpha(t.pixels[i], 1.0 - maskValue(m->pixels[i]) / 255.0);
+        for (TiledImage& img : after.cels) { // the mask belongs to the layer: every frame
+            for (int ty = 0; ty < img.tilesY(); ++ty) {
+                for (int tx = 0; tx < img.tilesX(); ++tx) {
+                    const TiledImage::Tile* m = after.mask->tile(tx, ty);
+                    if (!m || !img.tile(tx, ty)) {
+                        continue; // unpainted mask = fully shown; empty layer tile stays empty
+                    }
+                    TiledImage::Tile& t = img.editTile(tx, ty);
+                    for (std::size_t i = 0; i < t.pixels.size(); ++i) {
+                        t.pixels[i] = eraseAlpha(t.pixels[i], 1.0 - maskValue(m->pixels[i]) / 255.0);
+                    }
                 }
             }
+            img.takeDirtyTiles();
         }
-        after.image.takeDirtyTiles();
+        after.image = after.cels[static_cast<std::size_t>(activeFrame_)];
     }
     after.mask.reset();
     replaceLayer(index, std::move(after), "Apply Layer Mask");
@@ -459,6 +486,17 @@ bool Document::rasterizeLayerEffects(int index) {
         return false;
     }
     Layer after = layers_[static_cast<std::size_t>(index)];
+    for (int f = 0; f < frameCount(); ++f) {
+        if (f == activeFrame_) {
+            continue;
+        }
+        Layer frameLayer = after; // render this frame's cel with the layer's effects
+        frameLayer.image = after.cels[static_cast<std::size_t>(f)];
+        frameLayer.effectCache.reset();
+        TiledImage rendered = effectImage(frameLayer);
+        rendered.takeDirtyTiles();
+        after.cels[static_cast<std::size_t>(f)] = std::move(rendered);
+    }
     after.image = renderedLayer(index); // shares the rendered tiles
     after.image.takeDirtyTiles();
     after.mask.reset();
@@ -797,6 +835,296 @@ bool Document::rotateContent90(bool clockwise) {
 
 // ---------------------------------------------------------------- canvas
 
+// ---------------------------------------------------------------- frames
+
+void Document::syncCels() {
+    for (Layer& l : layers_) {
+        if (l.cels.size() != frames_.size()) {
+            l.cels.resize(frames_.size(), TiledImage(width_, height_));
+        }
+        l.cels[static_cast<std::size_t>(activeFrame_)] = l.image;
+    }
+}
+
+void Document::switchFrame(int index) {
+    syncCels();
+    activeFrame_ = index;
+    for (Layer& l : layers_) {
+        l.image = l.cels[static_cast<std::size_t>(index)];
+    }
+    structureDirty_ = true;
+    ++framesGeneration_;
+}
+
+void Document::normalizeLayer(Layer& layer) const {
+    layer.cels.resize(frames_.size(), TiledImage(width_, height_));
+    layer.cels[static_cast<std::size_t>(activeFrame_)] = layer.image;
+}
+
+bool Document::setActiveFrame(int index) {
+    if (busy() || index < 0 || index >= frameCount()) {
+        return false;
+    }
+    if (index != activeFrame_) {
+        switchFrame(index);
+    }
+    return true;
+}
+
+Document::AnimationState Document::animationState() {
+    syncCels();
+    return {layers_, frames_, tags_, activeFrame_};
+}
+
+void Document::executeAnimation(const std::string& label, AnimationState after) {
+    for (Layer& l : after.layers) {
+        l.image = l.cels[static_cast<std::size_t>(after.activeFrame)];
+    }
+    auto before = std::make_shared<const AnimationState>(animationState());
+    auto next = std::make_shared<const AnimationState>(std::move(after));
+    const auto apply = [this](const AnimationState& s) {
+        layers_ = s.layers;
+        frames_ = s.frames;
+        tags_ = s.tags;
+        activeFrame_ = s.activeFrame;
+        structureDirty_ = true;
+        ++framesGeneration_;
+    };
+    Command cmd{label, [apply, before] { apply(*before); }, [apply, next] { apply(*next); }};
+    cmd.animationState = true;
+    execute(std::move(cmd));
+}
+
+namespace {
+
+// Tag ranges after inserting one frame at `at` (after frame at - 1).
+void shiftTagsForInsert(std::vector<FrameTag>& tags, int at) {
+    for (FrameTag& t : tags) {
+        if (t.from >= at) { // entirely after the insertion point: shifts
+            ++t.from;
+            ++t.to;
+        } else if (t.to >= at - 1) { // inserted inside the tag or right after its end: grows
+            ++t.to;
+        }
+    }
+}
+
+} // namespace
+
+bool Document::addFrame() {
+    if (busy() || frameCount() >= kMaxFrames) {
+        return false;
+    }
+    AnimationState s = animationState();
+    const int at = activeFrame_ + 1;
+    for (Layer& l : s.layers) {
+        l.cels.insert(l.cels.begin() + at, TiledImage(width_, height_));
+    }
+    s.frames.insert(s.frames.begin() + at, frames_[static_cast<std::size_t>(activeFrame_)]);
+    shiftTagsForInsert(s.tags, at);
+    s.activeFrame = at;
+    executeAnimation("New Frame", std::move(s));
+    return true;
+}
+
+bool Document::duplicateFrame(int index) {
+    if (busy() || index < 0 || index >= frameCount() || frameCount() >= kMaxFrames) {
+        return false;
+    }
+    AnimationState s = animationState();
+    const int at = index + 1;
+    for (Layer& l : s.layers) {
+        TiledImage copy = l.cels[static_cast<std::size_t>(index)]; // shares tiles (copy-on-write)
+        l.cels.insert(l.cels.begin() + at, std::move(copy));
+    }
+    s.frames.insert(s.frames.begin() + at, frames_[static_cast<std::size_t>(index)]);
+    shiftTagsForInsert(s.tags, at);
+    s.activeFrame = at;
+    executeAnimation("Duplicate Frame", std::move(s));
+    return true;
+}
+
+bool Document::removeFrame(int index) {
+    if (busy() || index < 0 || index >= frameCount() || frameCount() <= 1) {
+        return false;
+    }
+    AnimationState s = animationState();
+    for (Layer& l : s.layers) {
+        l.cels.erase(l.cels.begin() + index);
+    }
+    s.frames.erase(s.frames.begin() + index);
+    std::vector<FrameTag> tags;
+    for (FrameTag t : s.tags) {
+        if (t.from == index && t.to == index) {
+            continue; // its only frame is gone
+        }
+        if (t.from > index) {
+            --t.from;
+        }
+        if (t.to >= index) {
+            --t.to;
+        }
+        tags.push_back(std::move(t));
+    }
+    s.tags = std::move(tags);
+    if (s.activeFrame > index || s.activeFrame >= static_cast<int>(s.frames.size())) {
+        --s.activeFrame;
+    }
+    executeAnimation("Delete Frame", std::move(s));
+    return true;
+}
+
+bool Document::moveFrame(int from, int to) {
+    if (busy() || from < 0 || to < 0 || from >= frameCount() || to >= frameCount() || from == to) {
+        return false;
+    }
+    AnimationState s = animationState();
+    const auto move = [from, to](auto& v) {
+        auto item = std::move(v[static_cast<std::size_t>(from)]);
+        v.erase(v.begin() + from);
+        v.insert(v.begin() + to, std::move(item));
+    };
+    for (Layer& l : s.layers) {
+        move(l.cels);
+    }
+    move(s.frames);
+    // The active frame follows its content.
+    const int a = activeFrame_;
+    if (a == from) {
+        s.activeFrame = to;
+    } else if (from < a && a <= to) {
+        s.activeFrame = a - 1;
+    } else if (to <= a && a < from) {
+        s.activeFrame = a + 1;
+    }
+    executeAnimation("Move Frame", std::move(s));
+    return true;
+}
+
+bool Document::setFrameDuration(int index, int ms) {
+    if (index < 0 || index >= frameCount()) {
+        return false;
+    }
+    std::vector<Frame> frames = frames_;
+    frames[static_cast<std::size_t>(index)].duration = ms;
+    return setFrames(std::move(frames), "Frame Duration");
+}
+
+bool Document::setFrames(std::vector<Frame> frames, const std::string& label) {
+    if (busy() || frames.size() != frames_.size()) {
+        return false;
+    }
+    for (Frame& f : frames) {
+        f.duration = std::clamp(f.duration, kMinFrameDuration, kMaxFrameDuration);
+    }
+    if (frames == frames_) {
+        return false;
+    }
+    AnimationState s = animationState();
+    s.frames = std::move(frames);
+    executeAnimation(label, std::move(s));
+    return true;
+}
+
+std::vector<FrameTag> Document::sanitizedTags(std::vector<FrameTag> tags, int count) const {
+    std::vector<FrameTag> out;
+    for (FrameTag& t : tags) {
+        if (t.name.empty()) {
+            continue;
+        }
+        t.from = std::clamp(t.from, 0, count - 1);
+        t.to = std::clamp(t.to, 0, count - 1);
+        if (t.from > t.to) {
+            std::swap(t.from, t.to);
+        }
+        const int d = static_cast<int>(t.direction);
+        if (d < 0 || d >= kTagDirectionCount) {
+            t.direction = TagDirection::Forward;
+        }
+        out.push_back(std::move(t));
+    }
+    return out;
+}
+
+bool Document::setTags(std::vector<FrameTag> tags, const std::string& label) {
+    tags = sanitizedTags(std::move(tags), frameCount());
+    if (busy() || tags == tags_) {
+        return false;
+    }
+    AnimationState s = animationState();
+    s.tags = std::move(tags);
+    executeAnimation(label, std::move(s));
+    return true;
+}
+
+const TiledImage& Document::cel(int layer, int frame) const {
+    const Layer& l = layers_.at(static_cast<std::size_t>(layer));
+    return frame == activeFrame_ ? l.image : l.cels.at(static_cast<std::size_t>(frame));
+}
+
+bool Document::celEmpty(int layer, int frame) const {
+    const TiledImage& img = cel(layer, frame);
+    for (int ty = 0; ty < img.tilesY(); ++ty) {
+        for (int tx = 0; tx < img.tilesX(); ++tx) {
+            if (img.tile(tx, ty)) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+TiledImage Document::flattenedFrame(int frame) const {
+    if (frame == activeFrame_) {
+        return flattenedImage();
+    }
+    std::vector<Layer> layers = layers_;
+    for (Layer& l : layers) {
+        l.image = l.cels.at(static_cast<std::size_t>(frame));
+        l.effectCache.reset(); // a private cache: don't thrash the active frame's
+    }
+    TiledImage out(width_, height_);
+    for (int ty = 0; ty < tilesY(); ++ty) {
+        for (int tx = 0; tx < tilesX(); ++tx) {
+            auto tile = std::make_shared<TiledImage::Tile>();
+            if (compositeLayersTile(*this, layers, tx, ty, *tile)) {
+                out.setTile(tx, ty, std::move(tile));
+            }
+        }
+    }
+    out.takeDirtyTiles();
+    return out;
+}
+
+void Document::restoreAnimation(std::vector<Frame> frames, std::vector<std::vector<TiledImage>> cels,
+                                std::vector<FrameTag> tags, int activeFrame) {
+    if (frames.empty() || frames.size() > static_cast<std::size_t>(kMaxFrames) || cels.size() != layers_.size()) {
+        throw std::invalid_argument("Invalid animation data");
+    }
+    for (const auto& layerCels : cels) {
+        if (layerCels.size() != frames.size()) {
+            throw std::invalid_argument("Cel count does not match the frames");
+        }
+        for (const TiledImage& img : layerCels) {
+            if (img.width() != width_ || img.height() != height_) {
+                throw std::invalid_argument("Cel size does not match the document");
+            }
+        }
+    }
+    for (Frame& f : frames) {
+        f.duration = std::clamp(f.duration, kMinFrameDuration, kMaxFrameDuration);
+    }
+    frames_ = std::move(frames);
+    activeFrame_ = std::clamp(activeFrame, 0, frameCount() - 1);
+    for (std::size_t i = 0; i < layers_.size(); ++i) {
+        layers_[i].cels = std::move(cels[i]);
+        layers_[i].image = layers_[i].cels[static_cast<std::size_t>(activeFrame_)];
+    }
+    tags_ = sanitizedTags(std::move(tags), frameCount());
+    structureDirty_ = true;
+    ++framesGeneration_;
+}
+
 // ---------------------------------------------------------------- slices
 
 std::vector<Slice> Document::sanitizedSlices(std::vector<Slice> slices) const {
@@ -861,12 +1189,16 @@ bool Document::crop(IRect area) {
     if (busy() || area.empty() || area == IRect{0, 0, width_, height_}) {
         return false;
     }
+    syncCels();
     std::vector<Layer> cropped;
     cropped.reserve(layers_.size());
     for (const Layer& l : layers_) {
         Layer c(l.props, croppedImage(l.image, area));
         if (l.mask) {
             c.mask = croppedImage(*l.mask, area);
+        }
+        for (int f = 0; f < frameCount(); ++f) {
+            c.cels.push_back(f == activeFrame_ ? c.image : croppedImage(l.cels[static_cast<std::size_t>(f)], area));
         }
         cropped.push_back(std::move(c));
     }
@@ -964,13 +1296,18 @@ const TiledImage& Document::effectImage(const Layer& l) const {
 }
 
 bool Document::compositeTile(int tx, int ty, TiledImage::Tile& out) const {
+    return compositeLayersTile(*this, layers_, tx, ty, out);
+}
+
+bool Document::compositeLayersTile(const Document& doc, const std::vector<Layer>& layers, int tx, int ty,
+                                   TiledImage::Tile& out) {
     bool any = false;
-    for (const Layer& l : layers_) {
+    for (const Layer& l : layers) {
         if (!l.props.visible || l.props.opacity <= 0.0) {
             continue;
         }
         const bool effects = hasActiveEffects(l.props.effects);
-        const TiledImage::Tile* t = (effects ? effectImage(l) : l.image).tile(tx, ty);
+        const TiledImage::Tile* t = (effects ? doc.effectImage(l) : l.image).tile(tx, ty);
         if (!t) {
             continue;
         }

@@ -4,6 +4,7 @@
 #include "EffectsPanel.h"
 #include "LayersPanel.h"
 #include "SlicesPanel.h"
+#include "TimelinePanel.h"
 
 #include <gas/core/Document.h>
 #include <gas/core/ProjectIO.h>
@@ -196,6 +197,7 @@ MainWindow::~MainWindow() {
     layersPanel_->setDocument(nullptr);
     effectsPanel_->setDocument(nullptr);
     slicesPanel_->setDocument(nullptr);
+    timelinePanel_->setDocument(nullptr);
 }
 
 void MainWindow::createActions() {
@@ -215,6 +217,7 @@ void MainWindow::createActions() {
                                         &MainWindow::exportAtlas);
     documentActions_ << file->addAction(tr("Export S&lices as PNGs..."), this, &MainWindow::exportSlices);
     documentActions_ << file->addAction(tr("Export La&yers as PNGs..."), this, &MainWindow::exportLayers);
+    documentActions_ << file->addAction(tr("Export &Frames as PNGs..."), this, &MainWindow::exportFrames);
     file->addSeparator();
     file->addAction(tr("E&xit"), QKeySequence::Quit, this, &QWidget::close);
 
@@ -262,6 +265,26 @@ void MainWindow::createActions() {
     image->addSeparator();
     documentActions_ << image->addAction(tr("&Auto Slice..."), this, &MainWindow::autoSlice);
     documentActions_ << image->addAction(tr("&Grid Slice..."), this, &MainWindow::gridSlice);
+
+    QMenu* anim = menuBar()->addMenu(tr("&Animation"));
+    documentActions_ << anim->addAction(tr("&New Frame"), QKeySequence(Qt::ALT | Qt::Key_N), this,
+                                        [this] { runFrameCommand(&TimelinePanel::addFrame); });
+    documentActions_ << anim->addAction(tr("&Duplicate Frame"), QKeySequence(Qt::ALT | Qt::Key_D), this,
+                                        [this] { runFrameCommand(&TimelinePanel::duplicateFrame); });
+    documentActions_ << anim->addAction(tr("De&lete Frame"), this,
+                                        [this] { runFrameCommand(&TimelinePanel::removeFrame); });
+    anim->addSeparator();
+    anim->addAction(tr("&Previous Frame"), QKeySequence(Qt::Key_Comma), this,
+                    [this] { runFrameCommand(&TimelinePanel::previousFrame); });
+    anim->addAction(tr("Ne&xt Frame"), QKeySequence(Qt::Key_Period), this,
+                    [this] { runFrameCommand(&TimelinePanel::nextFrame); });
+    anim->addAction(tr("P&lay / Stop"), QKeySequence(Qt::Key_P), this,
+                    [this] { timelinePanel_->togglePlay(); });
+    anim->addSeparator();
+    onionAction_ = anim->addAction(tr("&Onion Skin"));
+    onionAction_->setCheckable(true);
+    onionAction_->setShortcut(QKeySequence(Qt::Key_F3));
+    documentActions_ << anim->addAction(tr("New &Tag..."), this, [this] { runFrameCommand(&TimelinePanel::newTag); });
 
     QMenu* view = menuBar()->addMenu(tr("&View"));
     view->addAction(tr("Reset &Symmetry Centre"), canvas_, &CanvasWidget::resetSymmetryCenter);
@@ -564,6 +587,23 @@ void MainWindow::createDocks() {
     connect(slicesPanel_, &SlicesPanel::autoSliceRequested, this, &MainWindow::autoSlice);
     connect(slicesPanel_, &SlicesPanel::gridSliceRequested, this, &MainWindow::gridSlice);
     connect(slicesPanel_, &SlicesPanel::exportAtlasRequested, this, &MainWindow::exportAtlas);
+
+    timelinePanel_ = new TimelinePanel(canvas_, this);
+    auto* timelineDock = new QDockWidget(tr("Timeline"), this);
+    timelineDock->setObjectName(QStringLiteral("timelineDock"));
+    timelineDock->setFeatures(QDockWidget::DockWidgetMovable | QDockWidget::DockWidgetFloatable);
+    timelineDock->setWidget(timelinePanel_);
+    // Side docks keep the full height; the timeline sits under the canvas only.
+    setCorner(Qt::BottomRightCorner, Qt::RightDockWidgetArea);
+    setCorner(Qt::BottomLeftCorner, Qt::LeftDockWidgetArea);
+    addDockWidget(Qt::BottomDockWidgetArea, timelineDock);
+    connect(timelinePanel_, &TimelinePanel::documentChanged, this, &MainWindow::onDocumentChanged, Qt::QueuedConnection);
+    connect(timelinePanel_, &TimelinePanel::viewChanged, this, [this] {
+        layersPanel_->refresh();
+        canvas_->update();
+        updateStatus();
+    });
+    connect(onionAction_, &QAction::toggled, timelinePanel_, &TimelinePanel::setOnionSkin);
     connect(effectsPanel_, &EffectsPanel::documentChanged, this, &MainWindow::onDocumentChanged,
             Qt::QueuedConnection);
     // Once laid out, give the layer list most of the height (sizes set before show() don't stick).
@@ -584,6 +624,7 @@ void MainWindow::setDocument(std::unique_ptr<gas::Document> document, const QStr
     layersPanel_->setDocument(document.get());
     effectsPanel_->setDocument(document.get());
     slicesPanel_->setDocument(document.get());
+    timelinePanel_->setDocument(document.get());
     document_ = std::move(document);
     filePath_ = path;
     onDocumentChanged();
@@ -612,6 +653,8 @@ void MainWindow::onDocumentChanged() {
     effectsPanel_->refresh();
     slicesPanel_->setEnabled(!transforming);
     slicesPanel_->refresh();
+    timelinePanel_->setEnabled(!transforming);
+    timelinePanel_->refresh();
     canvas_->update();
 }
 
@@ -674,12 +717,14 @@ void MainWindow::cropToSelection() {
 }
 
 void MainWindow::undo() {
+    timelinePanel_->stop();
     if (!canvas_->isBusy() && document_->undo()) {
         onDocumentChanged();
     }
 }
 
 void MainWindow::redo() {
+    timelinePanel_->stop();
     if (!canvas_->isBusy() && document_->redo()) {
         onDocumentChanged();
     }
@@ -814,7 +859,10 @@ void MainWindow::updateColorSwatch() {
 }
 
 void MainWindow::updateStatus() {
-    zoomLabel_->setText(tr("%1%").arg(canvas_->zoom() * 100.0, 0, 'f', 1));
+    zoomLabel_->setText(document_ && document_->frameCount() > 1
+                            ? tr("Frame %1/%2   %3%").arg(document_->activeFrame() + 1).arg(document_->frameCount())
+                                  .arg(canvas_->zoom() * 100.0, 0, 'f', 1)
+                            : tr("%1%").arg(canvas_->zoom() * 100.0, 0, 'f', 1));
     if (const auto p = canvas_->cursorPixel()) {
         cursorLabel_->setText(tr("X: %1  Y: %2").arg(p->x).arg(p->y));
     } else {
@@ -1053,13 +1101,38 @@ void MainWindow::gridSlice() {
 
 void MainWindow::exportAtlas() {
     settleCanvas();
-    if (document_->slices().empty()) {
+    if (document_->slices().empty() && document_->frameCount() < 2) {
         QMessageBox::information(this, tr("Export Atlas"),
                                  tr("There are no slices yet. Use the Slice tool (K), Image > Auto Slice or "
-                                    "Image > Grid Slice to mark the sprites first."));
+                                    "Image > Grid Slice to mark the sprites first, or add animation frames."));
         return;
     }
     FormDialog d(this, tr("Export Atlas"));
+    auto* content = new QComboBox(&d.dialog);
+    content->addItem(tr("Slices of this frame"));
+    content->addItem(tr("Animation frames (every frame%1)")
+                         .arg(document_->slices().empty() ? tr(", whole canvas") : tr(" of every slice")));
+    if (atlasContent_ < 0) {
+        atlasContent_ = document_->frameCount() > 1 ? 1 : 0;
+    }
+    content->setCurrentIndex(document_->slices().empty() ? 1 : atlasContent_);
+    if (document_->slices().empty()) {
+        content->setEnabled(false);
+    }
+    d.form->addRow(tr("Content:"), content);
+    auto* framePivot = new QComboBox(&d.dialog);
+    fillPivotCombo(framePivot);
+    framePivot->removeItem(framePivot->count() - 1);
+    framePivot->setCurrentIndex(atlasFramePivot_);
+    framePivot->setToolTip(tr("One pivot for every frame, relative to the canvas (frames without slices)"));
+    d.form->addRow(tr("Frame pivot:"), framePivot);
+    auto* layout = new QComboBox(&d.dialog);
+    layout->addItem(tr("Packed (MaxRects)"));
+    layout->addItem(tr("Grid (equal cells, in order)"));
+    layout->setCurrentIndex(atlasSettings_.grid ? 1 : 0);
+    d.form->addRow(tr("Layout:"), layout);
+    QSpinBox* columns = d.spin(tr("Grid columns:"), 0, 1000, atlasSettings_.columns);
+    columns->setSpecialValueText(tr("Auto"));
     auto* preset = new QComboBox(&d.dialog);
     for (int i = 0; i < gas::kAtlasPresetCount; ++i) {
         preset->addItem(tr(gas::atlasPresetName(static_cast<gas::AtlasPreset>(i)).data()));
@@ -1120,6 +1193,10 @@ void MainWindow::exportAtlas() {
     };
     const auto syncNote = [&] {
         const auto f = static_cast<gas::AtlasFormat>(format->currentIndex());
+        const bool frames = content->currentIndex() == 1;
+        framePivot->setEnabled(frames && document_->slices().empty());
+        columns->setEnabled(layout->currentIndex() == 1);
+        trim->setEnabled(layout->currentIndex() == 0);
         point->setEnabled(f == gas::AtlasFormat::UnityMeta);
         ppu->setEnabled(f == gas::AtlasFormat::UnityMeta);
         switch (f) {
@@ -1145,6 +1222,9 @@ void MainWindow::exportAtlas() {
         syncNote();
     });
     QObject::connect(format, &QComboBox::currentIndexChanged, &d.dialog, syncNote);
+    QObject::connect(content, &QComboBox::currentIndexChanged, &d.dialog, syncNote);
+    QObject::connect(layout, &QComboBox::currentIndexChanged, &d.dialog, syncNote);
+    syncNote();
     if (!d.exec()) {
         return;
     }
@@ -1158,7 +1238,12 @@ void MainWindow::exportAtlas() {
     s.powerOfTwo = pot->isChecked();
     s.pointFilter = point->isChecked();
     s.pixelsPerUnit = ppu->value();
+    s.grid = layout->currentIndex() == 1;
+    s.columns = columns->value();
     atlasSettings_ = s;
+    atlasContent_ = content->currentIndex();
+    atlasFramePivot_ = framePivot->currentIndex();
+    const bool animation = content->currentIndex() == 1;
     atlasPreset_ = preset->currentIndex();
     QString file = QDir::fromNativeSeparators(path->text().trimmed());
     if (file.isEmpty()) {
@@ -1169,7 +1254,14 @@ void MainWindow::exportAtlas() {
     }
     atlasPath_ = file;
 
-    const gas::Atlas atlas = gas::packAtlas(gas::spritesFromSlices(*document_), s);
+    gas::Atlas atlas = gas::packAtlas(
+        animation ? gas::spritesFromFrames(*document_, QFileInfo(file).completeBaseName().toStdString(),
+                                           pivotFromCombo(framePivot, {0.5, 1.0}))
+                  : gas::spritesFromSlices(*document_),
+        s);
+    if (animation) {
+        atlas.tags = gas::tagsForFrameSprites(*document_);
+    }
     std::vector<std::filesystem::path> written;
     const gas::IoResult result = gas::exportAtlas(atlas, s, toFsPath(file), &written);
     if (!result.ok) {
@@ -1244,4 +1336,50 @@ void MainWindow::exportLayers() {
         return;
     }
     statusBar()->showMessage(tr("Exported %1 layers to %2").arg(written.size()).arg(QDir::toNativeSeparators(dir)), 6000);
+}
+
+void MainWindow::runFrameCommand(void (TimelinePanel::*command)()) {
+    settleCanvas();
+    if (canvas_->isBusy()) {
+        return;
+    }
+    (timelinePanel_->*command)();
+}
+
+void MainWindow::exportFrames() {
+    settleCanvas();
+    static int lastScale = 1;
+    FormDialog d(this, tr("Export Frames as PNGs"));
+    auto* folder = new QLineEdit(&d.dialog);
+    auto* browse = new QPushButton(tr("Browse..."), &d.dialog);
+    auto* row = new QHBoxLayout;
+    row->addWidget(folder, 1);
+    row->addWidget(browse);
+    d.form->addRow(tr("Folder:"), row);
+    if (exportDir_.isEmpty()) {
+        exportDir_ = QDir(filePath_.isEmpty() ? QDir::homePath() : QFileInfo(filePath_).path()).filePath(documentBaseName());
+    }
+    folder->setText(QDir::toNativeSeparators(exportDir_));
+    QObject::connect(browse, &QPushButton::clicked, &d.dialog, [&] {
+        const QString chosen = QFileDialog::getExistingDirectory(&d.dialog, tr("Export Folder"), folder->text());
+        if (!chosen.isEmpty()) {
+            folder->setText(QDir::toNativeSeparators(chosen));
+        }
+    });
+    auto* name = new QLineEdit(documentBaseName(), &d.dialog);
+    d.form->addRow(tr("File name prefix:"), name);
+    QSpinBox* scale = d.spin(tr("Scale (nearest neighbour):"), 1, 16, lastScale, tr("\u00D7"));
+    if (!d.exec() || folder->text().trimmed().isEmpty()) {
+        return;
+    }
+    lastScale = scale->value();
+    exportDir_ = QDir::fromNativeSeparators(folder->text().trimmed());
+    const std::string base = name->text().trimmed().isEmpty() ? "frame" : name->text().trimmed().toStdString();
+    std::vector<std::filesystem::path> written;
+    const gas::IoResult r = gas::exportFramePngs(*document_, toFsPath(exportDir_), base, lastScale, &written);
+    if (!r.ok) {
+        QMessageBox::warning(this, tr("Export Failed"), QString::fromStdString(r.error));
+        return;
+    }
+    statusBar()->showMessage(tr("Exported %1 frames to %2").arg(written.size()).arg(QDir::toNativeSeparators(exportDir_)), 6000);
 }

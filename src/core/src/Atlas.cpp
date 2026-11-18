@@ -194,8 +194,9 @@ Atlas packAtlas(const std::vector<AtlasSprite>& sprites, const AtlasSettings& in
         f.sourceWidth = std::max(1, sp.width);
         f.sourceHeight = std::max(1, sp.height);
         f.pivot = sp.pivot;
+        f.duration = sp.duration;
         f.source = {0, 0, f.sourceWidth, f.sourceHeight};
-        if (s.trim && sp.width > 0 && sp.height > 0 &&
+        if (s.trim && !s.grid && sp.width > 0 && sp.height > 0 &&
             sp.pixels.size() == static_cast<std::size_t>(sp.width) * static_cast<std::size_t>(sp.height)) {
             int x0 = sp.width, y0 = sp.height, x1 = -1, y1 = -1;
             for (int y = 0; y < sp.height; ++y) {
@@ -229,6 +230,58 @@ Atlas packAtlas(const std::vector<AtlasSprite>& sprites, const AtlasSettings& in
             atlas.frames.clear();
             return atlas;
         }
+    }
+
+    if (s.grid) {
+        // Equal cells, input order, as many rows per page as fit.
+        int cellW = 1, cellH = 1;
+        for (const Item& it : items) {
+            cellW = std::max(cellW, it.w);
+            cellH = std::max(cellH, it.h);
+        }
+        const int fitCols = std::max(1, binMaxW / cellW), fitRows = std::max(1, binMaxH / cellH);
+        const int n = static_cast<int>(items.size());
+        int cols = s.columns > 0 ? s.columns : static_cast<int>(std::ceil(std::sqrt(static_cast<double>(n))));
+        cols = std::clamp(cols, 1, fitCols);
+        const int perPage = cols * fitRows;
+        for (int first = 0; first < n; first += perPage) {
+            const int count = std::min(perPage, n - first);
+            const int rows = (count + cols - 1) / cols;
+            const int usedCols = std::min(cols, count);
+            AtlasPage page;
+            page.width = std::max(1, usedCols * cellW - s.padding + 2 * s.border);
+            page.height = std::max(1, rows * cellH - s.padding + 2 * s.border);
+            if (s.powerOfTwo) {
+                page.width = std::min(nextPow2(page.width), s.maxWidth);
+                page.height = std::min(nextPow2(page.height), s.maxHeight);
+            }
+            page.pixels.assign(static_cast<std::size_t>(page.width) * static_cast<std::size_t>(page.height), Rgba8{});
+            for (int k = 0; k < count; ++k) {
+                const std::size_t i = static_cast<std::size_t>(first + k);
+                AtlasFrame& f = atlas.frames[i];
+                const AtlasSprite& sp = sprites[i];
+                f.page = static_cast<int>(atlas.pages.size());
+                f.frame.x = s.border + (k % cols) * cellW + s.extrude;
+                f.frame.y = s.border + (k / cols) * cellH + s.extrude;
+                if (sp.pixels.size() != static_cast<std::size_t>(sp.width) * static_cast<std::size_t>(sp.height)) {
+                    continue;
+                }
+                for (int y = -s.extrude; y < f.frame.h + s.extrude; ++y) {
+                    const int sy = f.source.y + std::clamp(y, 0, f.frame.h - 1);
+                    for (int x = -s.extrude; x < f.frame.w + s.extrude; ++x) {
+                        const int sx = f.source.x + std::clamp(x, 0, f.frame.w - 1);
+                        if (sx < sp.width && sy < sp.height) {
+                            page.pixels[static_cast<std::size_t>(f.frame.y + y) * static_cast<std::size_t>(page.width) +
+                                        static_cast<std::size_t>(f.frame.x + x)] =
+                                sp.pixels[static_cast<std::size_t>(sy) * static_cast<std::size_t>(sp.width) +
+                                          static_cast<std::size_t>(sx)];
+                        }
+                    }
+                }
+            }
+            atlas.pages.push_back(std::move(page));
+        }
+        return atlas;
     }
 
     std::vector<std::size_t> remaining(items.size());
@@ -348,6 +401,52 @@ std::vector<AtlasSprite> spritesFromSlices(const Document& document) {
     std::vector<AtlasSprite> out;
     for (const Slice& slice : document.slices()) {
         out.push_back({slice.name, slice.rect.w, slice.rect.h, copyPixels(image, slice.rect), slice.pivot});
+    }
+    return out;
+}
+
+std::vector<AtlasSprite> spritesFromFrames(const Document& document, const std::string& baseName, PointF pivot) {
+    std::vector<AtlasSprite> out;
+    const int n = document.frameCount();
+    const std::size_t digits = std::max<std::size_t>(2, std::to_string(n - 1).size());
+    const auto number = [digits](int f) {
+        std::string s = std::to_string(f);
+        s.insert(0, digits - std::min(digits, s.size()), '0');
+        return s;
+    };
+    std::vector<TiledImage> frames;
+    for (int f = 0; f < n; ++f) {
+        frames.push_back(document.flattenedFrame(f));
+    }
+    const auto duration = [&](int f) { return document.frames()[static_cast<std::size_t>(f)].duration; };
+    if (document.slices().empty()) {
+        const IRect all{0, 0, document.width(), document.height()};
+        for (int f = 0; f < n; ++f) {
+            out.push_back({baseName + "_" + number(f), all.w, all.h, copyPixels(frames[static_cast<std::size_t>(f)], all),
+                           pivot, duration(f)});
+        }
+        return out;
+    }
+    for (const Slice& slice : document.slices()) {
+        for (int f = 0; f < n; ++f) {
+            out.push_back({slice.name + "_" + number(f), slice.rect.w, slice.rect.h,
+                           copyPixels(frames[static_cast<std::size_t>(f)], slice.rect), slice.pivot, duration(f)});
+        }
+    }
+    return out;
+}
+
+std::vector<FrameTag> tagsForFrameSprites(const Document& document) {
+    if (document.slices().empty()) {
+        return document.tags();
+    }
+    std::vector<FrameTag> out;
+    const int n = document.frameCount();
+    for (std::size_t k = 0; k < document.slices().size(); ++k) {
+        const int base = static_cast<int>(k) * n;
+        for (const FrameTag& t : document.tags()) {
+            out.push_back({document.slices()[k].name + "_" + t.name, base + t.from, base + t.to, t.direction});
+        }
     }
     return out;
 }
@@ -474,7 +573,8 @@ std::string atlasJson(const Atlas& atlas, int page, const std::string& imageFile
         o += "      \"spriteSourceSize\": {\"x\": " + num(f.source.x) + ", \"y\": " + num(f.source.y) +
              ", \"w\": " + num(f.source.w) + ", \"h\": " + num(f.source.h) + "},\n";
         o += "      \"sourceSize\": {\"w\": " + num(f.sourceWidth) + ", \"h\": " + num(f.sourceHeight) + "},\n";
-        o += "      \"pivot\": {\"x\": " + num(f.pivot.x) + ", \"y\": " + num(f.pivot.y) + "}\n";
+        o += "      \"pivot\": {\"x\": " + num(f.pivot.x) + ", \"y\": " + num(f.pivot.y) + "}";
+        o += f.duration > 0 ? ",\n      \"duration\": " + num(f.duration) + "\n" : "\n";
         o += k + 1 < frames.size() ? "    },\n" : "    }\n";
     }
     o += "  },\n  \"meta\": {\n";
@@ -482,7 +582,19 @@ std::string atlasJson(const Atlas& atlas, int page, const std::string& imageFile
     o += "    \"image\": " + jsonString(imageFile) + ",\n";
     o += "    \"format\": \"RGBA8888\",\n";
     o += "    \"size\": {\"w\": " + num(pg.width) + ", \"h\": " + num(pg.height) + "},\n";
-    o += "    \"scale\": \"1\"\n  }\n}\n";
+    o += "    \"scale\": \"1\"";
+    if (!atlas.tags.empty()) {
+        static constexpr const char* kDirections[kTagDirectionCount] = {"forward", "reverse", "pingpong"};
+        o += ",\n    \"frameTags\": [\n";
+        for (std::size_t k = 0; k < atlas.tags.size(); ++k) {
+            const FrameTag& t = atlas.tags[k];
+            o += "      {\"name\": " + jsonString(t.name) + ", \"from\": " + num(t.from) + ", \"to\": " + num(t.to) +
+                 ", \"direction\": \"" + kDirections[static_cast<int>(t.direction)] + "\"}";
+            o += k + 1 < atlas.tags.size() ? ",\n" : "\n";
+        }
+        o += "    ]";
+    }
+    o += "\n  }\n}\n";
     return o;
 }
 
@@ -661,6 +773,35 @@ IoResult exportAtlas(const Atlas& atlas, const AtlasSettings& settings, const fs
         }
         }
         if (!r.ok) {
+            return r;
+        }
+    }
+    return {true, {}};
+}
+
+IoResult exportFramePngs(const Document& document, const fs::path& folder, const std::string& baseName, int scale,
+                         std::vector<fs::path>* written) {
+    if (IoResult r = makeFolder(folder); !r.ok) {
+        return r;
+    }
+    scale = std::clamp(scale, 1, 16);
+    const int n = document.frameCount();
+    const std::size_t digits = std::max<std::size_t>(2, std::to_string(n - 1).size());
+    const int w = document.width() * scale, h = document.height() * scale;
+    for (int f = 0; f < n; ++f) {
+        const std::vector<Rgba8> src = copyPixels(document.flattenedFrame(f), {0, 0, document.width(), document.height()});
+        std::vector<Rgba8> out(static_cast<std::size_t>(w) * static_cast<std::size_t>(h));
+        for (int y = 0; y < h; ++y) {
+            for (int x = 0; x < w; ++x) {
+                out[static_cast<std::size_t>(y) * static_cast<std::size_t>(w) + static_cast<std::size_t>(x)] =
+                    src[static_cast<std::size_t>(y / scale) * static_cast<std::size_t>(document.width()) +
+                        static_cast<std::size_t>(x / scale)];
+            }
+        }
+        std::string number = std::to_string(f);
+        number.insert(0, digits - std::min(digits, number.size()), '0');
+        if (IoResult r = writePng(folder / fromUtf8(safeFileName(baseName) + "_" + number + ".png"), w, h, out, written);
+            !r.ok) {
             return r;
         }
     }

@@ -38,6 +38,27 @@ struct Slice {
     friend bool operator==(const Slice&, const Slice&) = default;
 };
 
+// One animation frame; layers hold one cel (image) per frame.
+struct Frame {
+    int duration = 100; // ms
+
+    friend bool operator==(const Frame&, const Frame&) = default;
+};
+
+// Playback direction of a tag. Stored in files: append only.
+enum class TagDirection { Forward, Reverse, PingPong };
+inline constexpr int kTagDirectionCount = 3;
+
+// A named frame range (e.g. "walk" = frames 0..7), inclusive.
+struct FrameTag {
+    std::string name;
+    int from = 0;
+    int to = 0;
+    TagDirection direction = TagDirection::Forward;
+
+    friend bool operator==(const FrameTag&, const FrameTag&) = default;
+};
+
 struct EffectCache;
 
 struct Layer {
@@ -49,6 +70,10 @@ struct Layer {
     // Non-destructive layer mask, painted like any image; see maskValue()
     // (unpainted = shown, black = hidden).
     std::optional<TiledImage> mask;
+    // One image per animation frame. `image` is the active frame's cel (what
+    // tools and rendering use); the document keeps cels[activeFrame] in sync
+    // with it after every operation. Masks and effects belong to the layer.
+    std::vector<TiledImage> cels;
     // Rendered "pixels + mask + effects", rebuilt lazily by the document. It
     // validates itself against the content, so copies may share it safely.
     mutable std::shared_ptr<EffectCache> effectCache;
@@ -159,6 +184,39 @@ public:
     bool flipContent(bool horizontal);
     bool rotateContent90(bool clockwise);
 
+    // --- Animation frames (each an undo step unless noted) ---
+    static constexpr int kMaxFrames = 10000;
+    static constexpr int kMinFrameDuration = 1;
+    static constexpr int kMaxFrameDuration = 60000;
+    int frameCount() const { return static_cast<int>(frames_.size()); }
+    int activeFrame() const { return activeFrame_; }
+    const std::vector<Frame>& frames() const { return frames_; }
+    // Switches the frame being shown and edited (a view choice, not an undo
+    // step); false while an edit or transform is open.
+    bool setActiveFrame(int index);
+    bool addFrame();                // empty frame after the active one; becomes active
+    bool duplicateFrame(int index); // copy (sharing tiles) right after it; becomes active
+    bool removeFrame(int index);    // the last remaining frame can't be removed
+    bool moveFrame(int from, int to);
+    bool setFrameDuration(int index, int ms);
+    bool setFrames(std::vector<Frame> frames, const std::string& label = "Frame Durations"); // same count
+    const std::vector<FrameTag>& tags() const { return tags_; }
+    // Replaces all tags (ranges clamped to the frames, empty names dropped).
+    bool setTags(std::vector<FrameTag> tags, const std::string& label = "Edit Tags");
+    // Layer `layer`'s cel in frame `frame` (the live image for the active frame).
+    const TiledImage& cel(int layer, int frame) const;
+    bool celEmpty(int layer, int frame) const;
+    // Composite of the visible layers in another frame (onion skin, export).
+    TiledImage flattenedFrame(int frame) const;
+    // For loaders: frames, cels ([layer][frame], each the document's size) and
+    // tags without an undo step; throws std::invalid_argument on a mismatch.
+    void restoreAnimation(std::vector<Frame> frames, std::vector<std::vector<TiledImage>> cels,
+                          std::vector<FrameTag> tags, int activeFrame);
+    // Increments on every undoable change, undo and redo (for view caches of other frames).
+    unsigned historyGeneration() const { return historyGeneration_; }
+    // Increments when frames, tags or the active frame change.
+    unsigned framesGeneration() const { return framesGeneration_; }
+
     // --- Slices (sprite regions; saved with the project) ---
     const std::vector<Slice>& slices() const { return slices_; }
     // Replaces all slices as one undo step. Rects are clipped to the canvas
@@ -220,6 +278,11 @@ private:
         std::shared_ptr<LayerProps> mergeAfter;
         // Mergeable slice edits: the shared "after" value.
         std::shared_ptr<std::vector<Slice>> mergeSlices;
+        // Frame the step was made in; undo/redo switch to it first, so a step
+        // always lands on the cels it was recorded against. Steps that restore
+        // the whole animation state (frame edits) keep -1.
+        int frame = -1;
+        bool animationState = false;
     };
     struct TileChange {
         int tx, ty;
@@ -242,6 +305,24 @@ private:
     };
 
     bool busy() const { return edit_.has_value() || transform_.has_value(); }
+    struct AnimationState {
+        std::vector<Layer> layers;
+        std::vector<Frame> frames;
+        std::vector<FrameTag> tags;
+        int activeFrame;
+    };
+    // cels[activeFrame_] = image for every layer.
+    void syncCels();
+    // Shows frame `index` (no undo step).
+    void switchFrame(int index);
+    // Gives a layer one cel per frame with `image` as the active one.
+    void normalizeLayer(Layer& layer) const;
+    AnimationState animationState();
+    // Replaces layers/frames/tags/active frame as one undo step.
+    void executeAnimation(const std::string& label, AnimationState after);
+    std::vector<FrameTag> sanitizedTags(std::vector<FrameTag> tags, int frameCount) const;
+    static bool compositeLayersTile(const Document& doc, const std::vector<Layer>& layers, int tx, int ty,
+                                    TiledImage::Tile& out);
     TiledImage& targetImage(int layer, bool mask);
     // Applies `cmd` (runs redo) and records it.
     void execute(Command cmd);
@@ -268,6 +349,11 @@ private:
     unsigned selectionGeneration_ = 0;
     std::vector<Slice> slices_;
     unsigned slicesGeneration_ = 0;
+    std::vector<Frame> frames_{Frame{}};
+    int activeFrame_ = 0;
+    std::vector<FrameTag> tags_;
+    unsigned historyGeneration_ = 0;
+    unsigned framesGeneration_ = 0;
 
     std::optional<EditSession> edit_;
     std::optional<TransformSession> transform_;

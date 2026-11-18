@@ -1,6 +1,7 @@
 #pragma once
 
 #include "gas/core/Color.h"
+#include "gas/core/Document.h"
 #include "gas/core/Geometry.h"
 #include "gas/core/ProjectIO.h"
 
@@ -10,8 +11,6 @@
 #include <vector>
 
 namespace gas {
-
-class Document;
 
 // Metadata written next to each atlas page. Append only (stored in settings).
 enum class AtlasFormat {
@@ -34,6 +33,10 @@ struct AtlasSettings {
     int extrude = 0;  // edge pixels repeated outward, so filtering never samples a neighbour
     bool trim = true; // pack only the opaque part; the metadata keeps the original size
     bool powerOfTwo = true;
+    // Grid layout instead of MaxRects: equal cells (the largest sprite), input
+    // order kept row by row, no trimming, e.g. classic animation strips.
+    bool grid = false;
+    int columns = 0; // grid columns per page (0 = about square)
     AtlasFormat format = AtlasFormat::JsonHash;
     // Unity only:
     bool pointFilter = false; // Point filtering and no compression (pixel art)
@@ -49,6 +52,7 @@ struct AtlasSprite {
     int height = 0;
     std::vector<Rgba8> pixels; // row-major, straight alpha
     PointF pivot{0.5, 0.5};    // relative to the sprite, top-left origin
+    int duration = 0;          // animation frame time in ms (0 = not a frame)
 };
 
 struct AtlasFrame {
@@ -60,6 +64,7 @@ struct AtlasFrame {
     int sourceHeight = 0;
     PointF pivot;     // relative to the original sprite, top-left origin
     bool trimmed = false;
+    int duration = 0;
 };
 
 struct AtlasPage {
@@ -71,6 +76,7 @@ struct AtlasPage {
 struct Atlas {
     std::vector<AtlasPage> pages;
     std::vector<AtlasFrame> frames; // same order as the input sprites
+    std::vector<FrameTag> tags;     // animation ranges over `frames` (set by the caller; JSON only)
     std::string error;              // non-empty = failed (e.g. a sprite bigger than a page)
     bool ok() const { return error.empty(); }
 };
@@ -81,6 +87,12 @@ Atlas packAtlas(const std::vector<AtlasSprite>& sprites, const AtlasSettings& se
 
 // One sprite per document slice, cut from the composite of the visible layers.
 std::vector<AtlasSprite> spritesFromSlices(const Document& document);
+// Animation export: every frame of every slice ("<slice>_<frame>", slice by
+// slice), or every whole frame ("<baseName>_<frame>", with `pivot`) when the
+// document has no slices; durations come from the frames.
+std::vector<AtlasSprite> spritesFromFrames(const Document& document, const std::string& baseName, PointF pivot);
+// The document's tags mapped onto spritesFromFrames() order (per slice: "<slice>_<tag>").
+std::vector<FrameTag> tagsForFrameSprites(const Document& document);
 
 // Page metadata in each format; `imageFile` is the page's PNG file name.
 std::string atlasJson(const Atlas& atlas, int page, const std::string& imageFile);
@@ -100,6 +112,9 @@ IoResult exportSlicePngs(const Document& document, const std::filesystem::path& 
 // Batch export: one canvas-sized PNG per layer (pixels + mask + effects, opacity applied).
 IoResult exportLayerPngs(const Document& document, const std::filesystem::path& folder,
                          std::vector<std::filesystem::path>* written = nullptr);
+// Batch export: one PNG per animation frame ("<baseName>_<frame>.png").
+IoResult exportFramePngs(const Document& document, const std::filesystem::path& folder, const std::string& baseName,
+                         int scale, std::vector<std::filesystem::path>* written = nullptr);
 // A file-system-safe version of `name` (reserved characters become '_').
 std::string safeFileName(const std::string& name);
 

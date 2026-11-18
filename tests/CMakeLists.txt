@@ -29,6 +29,7 @@ add_executable(gas_core_tests
     StreamLineTest.cpp
     SlicingTest.cpp
     AtlasTest.cpp
+    AnimationTest.cpp
     EffectsTest.cpp
 )
 find_package(ZLIB REQUIRED) # the PNG test decodes with zlib directly

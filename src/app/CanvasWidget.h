@@ -81,6 +81,11 @@ public:
     bool showSlices() const { return showSlices_; }
     void setShowSlices(bool on);
 
+    // Onion skin: up to `before` earlier frames tinted red and `after` later
+    // frames tinted blue, fading with distance, under the current frame.
+    void setOnionSkin(bool on, int before, int after);
+    bool onionSkin() const { return onion_; }
+
     int fillTolerance() const { return fillTolerance_; }
     void setFillTolerance(int tolerance) { fillTolerance_ = tolerance; }
 
@@ -179,6 +184,8 @@ private:
     void finishSliceDrag();
     void nudgeSlice(int dx, int dy);
     void drawSlices(QPainter& p) const;
+    void drawOnionSkin(QPainter& p, const QRectF& canvasRect, const QRectF& visible);
+    const QImage& onionImage(int frame, bool earlier);
     QRectF sliceScreenRect(const gas::IRect& r) const;
     QPointF slicePivotScreen(const gas::Slice& s) const;
     int sliceAt(QPointF pos) const;       // topmost slice under the point (selected first), or -1
@@ -246,6 +253,12 @@ private:
     std::optional<SliceDrag> sliceDrag_;
     int selectedSlice_ = -1;
     bool showSlices_ = true;
+
+    // Onion skin (cached tinted composites of other frames, keyed by frame*2 + earlier)
+    bool onion_ = false;
+    int onionBefore_ = 1, onionAfter_ = 1;
+    QHash<int, QImage> onionCache_;
+    unsigned onionGeneration_ = ~0u;
 
     // Transform
     std::optional<TransformState> transform_;

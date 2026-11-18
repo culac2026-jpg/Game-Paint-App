@@ -17,6 +17,7 @@ class BrushPanel;
 class EffectsPanel;
 class LayersPanel;
 class SlicesPanel;
+class TimelinePanel;
 class QAction;
 class QCheckBox;
 class QComboBox;
@@ -62,6 +63,8 @@ private:
     void exportAtlas();
     void exportSlices();
     void exportLayers();
+    void exportFrames();
+    void runFrameCommand(void (TimelinePanel::*command)());
     QString documentBaseName() const; // file stem, or "sprite"
     // Asks to save unsaved changes; false if the user cancelled.
     bool maybeSave();
@@ -91,6 +94,10 @@ private:
     EffectsPanel* effectsPanel_ = nullptr;
     SlicesPanel* slicesPanel_ = nullptr;
     QDockWidget* slicesDock_ = nullptr;
+    TimelinePanel* timelinePanel_ = nullptr;
+    QAction* onionAction_ = nullptr;
+    int atlasContent_ = -1;   // 0 = slices of this frame, 1 = animation frames (-1 = pick by document)
+    int atlasFramePivot_ = 1; // pivot preset for whole-canvas frames (bottom centre)
     gas::AtlasSettings atlasSettings_ = gas::atlasPreset(gas::AtlasPreset::Unity);
     int atlasPreset_ = 0;
     QString atlasPath_;   // last atlas PNG

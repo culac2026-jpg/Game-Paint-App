@@ -232,6 +232,7 @@ void CanvasWidget::setDocument(gas::Document* document) {
     dragPoints_.clear();
     document_ = document;
     tileCache_.clear();
+    onionCache_.clear();
     outline_.clear();
     outlineGeneration_ = ~0u;
     if (document_) {
@@ -338,6 +339,7 @@ void CanvasWidget::paintGL() {
         static const QPixmap checker = makeCheckerPixmap();
         p.setBrushOrigin(canvasRect.topLeft());
         p.fillRect(visible, QBrush(checker));
+        drawOnionSkin(p, canvasRect, visible);
 
         // Tiles, nearest-neighbour so pixel art stays crisp at any zoom.
         p.setRenderHint(QPainter::SmoothPixmapTransform, false);
@@ -1440,6 +1442,77 @@ void CanvasWidget::drawSlices(QPainter& p) const {
             p.drawLine(c - QPointF(7, 0), c + QPointF(7, 0));
             p.drawLine(c - QPointF(0, 7), c + QPointF(0, 7));
             p.setRenderHint(QPainter::Antialiasing, false);
+        }
+    }
+    p.restore();
+}
+
+// ---------------------------------------------------------------- onion skin
+
+void CanvasWidget::setOnionSkin(bool on, int before, int after) {
+    onion_ = on;
+    onionBefore_ = std::clamp(before, 0, 10);
+    onionAfter_ = std::clamp(after, 0, 10);
+    update();
+}
+
+const QImage& CanvasWidget::onionImage(int frame, bool earlier) {
+    if (document_->historyGeneration() != onionGeneration_) {
+        onionCache_.clear(); // any edit, undo or frame change may alter other frames
+        onionGeneration_ = document_->historyGeneration();
+    }
+    const int key = frame * 2 + (earlier ? 1 : 0);
+    auto it = onionCache_.find(key);
+    if (it != onionCache_.end()) {
+        return *it;
+    }
+    const gas::TiledImage img = document_->flattenedFrame(frame);
+    QImage out(img.width(), img.height(), QImage::Format_ARGB32_Premultiplied);
+    out.fill(Qt::transparent);
+    const QColor tint = earlier ? QColor(255, 50, 50) : QColor(50, 110, 255);
+    for (int ty = 0; ty < img.tilesY(); ++ty) {
+        for (int tx = 0; tx < img.tilesX(); ++tx) {
+            const gas::TiledImage::Tile* t = img.tile(tx, ty);
+            if (!t) {
+                continue;
+            }
+            const int w = std::min(kTile, img.width() - tx * kTile), h = std::min(kTile, img.height() - ty * kTile);
+            for (int y = 0; y < h; ++y) {
+                auto* line = reinterpret_cast<QRgb*>(out.scanLine(ty * kTile + y)) + tx * kTile;
+                for (int x = 0; x < w; ++x) {
+                    const gas::Rgba8 s = t->pixels[static_cast<std::size_t>(y * kTile + x)];
+                    if (s.a == 0) {
+                        continue;
+                    }
+                    // Half way towards the tint keeps the drawing readable.
+                    const int r = (s.r + tint.red()) / 2, g = (s.g + tint.green()) / 2, b = (s.b + tint.blue()) / 2;
+                    line[x] = qPremultiply(qRgba(r, g, b, s.a));
+                }
+            }
+        }
+    }
+    return *onionCache_.insert(key, std::move(out));
+}
+
+void CanvasWidget::drawOnionSkin(QPainter& p, const QRectF& canvasRect, const QRectF& visible) {
+    if (!onion_ || !document_ || document_->frameCount() < 2) {
+        return;
+    }
+    const int active = document_->activeFrame();
+    p.save();
+    p.setClipRect(visible);
+    p.setRenderHint(QPainter::SmoothPixmapTransform, false);
+    // Farthest first, so nearer frames sit on top.
+    for (int k = onionBefore_; k >= 1; --k) {
+        if (active - k >= 0) {
+            p.setOpacity(0.5 / k);
+            p.drawImage(canvasRect, onionImage(active - k, true));
+        }
+    }
+    for (int k = onionAfter_; k >= 1; --k) {
+        if (active + k < document_->frameCount()) {
+            p.setOpacity(0.5 / k);
+            p.drawImage(canvasRect, onionImage(active + k, false));
         }
     }
     p.restore();

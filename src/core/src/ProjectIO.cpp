@@ -33,6 +33,9 @@ constexpr std::uint32_t kChunkMask = fourcc("LMSK");
 constexpr std::uint32_t kChunkLayerProps = fourcc("LPRP");
 constexpr std::uint32_t kChunkEffects = fourcc("LEFX");
 constexpr std::uint32_t kChunkSlices = fourcc("SLCS");
+constexpr std::uint32_t kChunkFrames = fourcc("FRMS");
+constexpr std::uint32_t kChunkCel = fourcc("CELS");
+constexpr std::uint32_t kChunkTags = fourcc("TAGS");
 constexpr std::uint32_t kChunkEnd = fourcc("END ");
 
 std::uint32_t crc32Of(const std::uint8_t* data, std::size_t size) {
@@ -237,7 +240,7 @@ IoResult saveProject(const Document& doc, const fs::path& path) {
         lw.raw(name.data(), name.size());
         lw.u8(static_cast<std::uint8_t>((layer.props.visible ? 1 : 0) | (layer.props.locked ? 2 : 0)));
         lw.f32(static_cast<float>(layer.props.opacity));
-        if (!writeTiles(lw, layer.image)) {
+        if (!writeTiles(lw, doc.cel(i, 0))) {
             return {false, "Compression failed"};
         }
         if (lw.bytes.size() > 0xFFFFFFFFull) {
@@ -281,6 +284,45 @@ IoResult saveProject(const Document& doc, const fs::path& path) {
             }
             w.chunk(kChunkEffects, ew);
         }
+    }
+    if (doc.frameCount() > 1) {
+        ByteWriter fw;
+        fw.u32(static_cast<std::uint32_t>(doc.frameCount()));
+        fw.u32(static_cast<std::uint32_t>(doc.activeFrame()));
+        for (const Frame& f : doc.frames()) {
+            fw.u32(static_cast<std::uint32_t>(f.duration));
+        }
+        w.chunk(kChunkFrames, fw);
+        for (int i = 0; i < doc.layerCount(); ++i) {
+            for (int f = 1; f < doc.frameCount(); ++f) {
+                if (doc.celEmpty(i, f)) {
+                    continue;
+                }
+                ByteWriter cw;
+                cw.u32(static_cast<std::uint32_t>(i));
+                cw.u32(static_cast<std::uint32_t>(f));
+                if (!writeTiles(cw, doc.cel(i, f))) {
+                    return {false, "Compression failed"};
+                }
+                if (cw.bytes.size() > 0xFFFFFFFFull) {
+                    return {false, "A frame is too large to save"};
+                }
+                w.chunk(kChunkCel, cw);
+            }
+        }
+    }
+    if (!doc.tags().empty()) {
+        ByteWriter tw;
+        tw.u32(static_cast<std::uint32_t>(doc.tags().size()));
+        for (const FrameTag& t : doc.tags()) {
+            const std::size_t n = std::min<std::size_t>(t.name.size(), 0xFFFF);
+            tw.u16(static_cast<std::uint16_t>(n));
+            tw.raw(t.name.data(), n);
+            tw.u32(static_cast<std::uint32_t>(t.from));
+            tw.u32(static_cast<std::uint32_t>(t.to));
+            tw.u8(static_cast<std::uint8_t>(t.direction));
+        }
+        w.chunk(kChunkTags, tw);
     }
     if (!doc.slices().empty()) {
         ByteWriter sw;
@@ -338,6 +380,15 @@ LoadResult loadProject(const fs::path& path) {
     bool haveHeader = false, haveEnd = false;
     std::vector<Layer> layers;
     std::vector<Slice> slices;
+    std::vector<Frame> frames;
+    int activeFrame = 0;
+    std::vector<std::vector<TiledImage>> cels; // [layer][frame], filled once layers and frames are known
+    struct PendingCel {
+        std::uint32_t layer, frame;
+        TiledImage image;
+    };
+    std::vector<PendingCel> pendingCels;
+    std::vector<FrameTag> tags;
 
     while (r.remaining() > 0 && !haveEnd) {
         const std::uint32_t tag = r.u32();
@@ -440,6 +491,50 @@ LoadResult loadProject(const fs::path& path) {
                 effects.push_back(sanitized(e));
             }
             layers[index].props.effects = std::move(effects);
+        } else if (tag == kChunkFrames) {
+            const std::uint32_t count = c.u32();
+            const std::uint32_t activeIndex = c.u32();
+            if (!c.ok() || !haveHeader || !frames.empty() || count == 0 ||
+                count > static_cast<std::uint32_t>(Document::kMaxFrames) || activeIndex >= count) {
+                return fail("Invalid frames");
+            }
+            for (std::uint32_t k = 0; k < count; ++k) {
+                frames.push_back({static_cast<int>(std::min<std::uint32_t>(c.u32(), Document::kMaxFrameDuration))});
+            }
+            if (!c.ok()) {
+                return fail("Invalid frames");
+            }
+            activeFrame = static_cast<int>(activeIndex);
+        } else if (tag == kChunkCel) {
+            const std::uint32_t layerIndex = c.u32();
+            const std::uint32_t frame = c.u32();
+            if (!c.ok() || !haveHeader || layerIndex >= expectedLayers || frame == 0 || frame >= frames.size()) {
+                return fail("Invalid cel");
+            }
+            TiledImage image(width, height);
+            if (std::string error = readTiles(c, image); !error.empty()) {
+                return fail(error);
+            }
+            pendingCels.push_back({layerIndex, frame, std::move(image)});
+        } else if (tag == kChunkTags) {
+            const std::uint32_t count = c.u32();
+            if (!c.ok() || count > c.remaining()) {
+                return fail("Invalid tags");
+            }
+            for (std::uint32_t k = 0; k < count; ++k) {
+                FrameTag t;
+                const std::uint16_t nameLength = c.u16();
+                const std::uint8_t* name = c.bytes(nameLength);
+                t.from = static_cast<int>(std::min<std::uint32_t>(c.u32(), Document::kMaxFrames));
+                t.to = static_cast<int>(std::min<std::uint32_t>(c.u32(), Document::kMaxFrames));
+                const std::uint8_t dir = c.u8();
+                if (!c.ok()) {
+                    return fail("Invalid tags");
+                }
+                t.name.assign(reinterpret_cast<const char*>(name), nameLength);
+                t.direction = dir < kTagDirectionCount ? static_cast<TagDirection>(dir) : TagDirection::Forward;
+                tags.push_back(std::move(t));
+            }
         } else if (tag == kChunkSlices) {
             const std::uint32_t count = c.u32();
             if (!c.ok() || count > c.remaining()) {
@@ -473,7 +568,26 @@ LoadResult loadProject(const fs::path& path) {
     if (layers.size() != expectedLayers) {
         return fail("Layer count does not match the header");
     }
+    if (!frames.empty()) {
+        cels.resize(layers.size());
+        for (std::size_t i = 0; i < layers.size(); ++i) {
+            cels[i].push_back(layers[i].image); // frame 0
+            cels[i].resize(frames.size(), TiledImage(width, height));
+        }
+        for (PendingCel& p : pendingCels) {
+            cels[p.layer][p.frame] = std::move(p.image);
+        }
+    }
     auto document = std::make_unique<Document>(width, height, std::move(layers), active);
+    if (!frames.empty()) {
+        document->restoreAnimation(std::move(frames), std::move(cels), std::move(tags), activeFrame);
+    } else if (!tags.empty()) { // a single-frame document with tags
+        std::vector<std::vector<TiledImage>> single;
+        for (int i = 0; i < document->layerCount(); ++i) {
+            single.push_back({document->layer(i).image});
+        }
+        document->restoreAnimation({Frame{}}, std::move(single), std::move(tags), 0);
+    }
     document->restoreSlices(std::move(slices)); // clipped/sanitised like any edit
     return {std::move(document), {}};
 }
