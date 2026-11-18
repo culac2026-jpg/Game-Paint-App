@@ -114,4 +114,21 @@ inline IRect mappedBounds(const Affine& m, const IRect& r) {
 
 enum class Interpolation { Nearest, Bilinear };
 
+// `to` rotated about `from` to the nearest multiple of `stepDegrees` (same
+// length), for straight lines snapped to 0/15/30/45/... degrees.
+inline PointF snapAngle(PointF from, PointF to, double stepDegrees) {
+    const double dx = to.x - from.x, dy = to.y - from.y;
+    const double len = std::hypot(dx, dy);
+    if (len <= 0.0 || stepDegrees <= 0.0) {
+        return to;
+    }
+    const double step = stepDegrees * 3.14159265358979323846 / 180.0;
+    const double angle = std::round(std::atan2(dy, dx) / step) * step;
+    double cs = std::cos(angle), sn = std::sin(angle);
+    // Exact axes, so horizontal/vertical lines stay on one pixel row/column.
+    if (std::abs(cs) < 1e-12) cs = 0.0;
+    if (std::abs(sn) < 1e-12) sn = 0.0;
+    return {from.x + len * cs, from.y + len * sn};
+}
+
 } // namespace gas

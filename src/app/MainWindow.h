@@ -90,6 +90,13 @@ private:
     QList<QAction*> brushOptionActions_; // shown for Brush / Eraser
     QList<QAction*> fillOptionActions_;  // shown for Fill
     QComboBox* selectionModeBox_ = nullptr;
+    QComboBox* symmetryBox_ = nullptr;
+    QSpinBox* segmentsBox_ = nullptr;
+    QList<QAction*> symmetryOptionActions_; // shown for stroke tools
+    QList<QAction*> segmentsOptionActions_;  // radial modes only
+    QAction* lineModeAction_ = nullptr;
+    QSpinBox* streamlineBox_ = nullptr;
+    int lastStreamline_ = 50; // restored by the toggle shortcut
     QCheckBox* antialiasBox_ = nullptr;
     QList<QAction*> selectionOptionActions_; // shown for selection tools
     QComboBox* interpolationBox_ = nullptr;

@@ -131,12 +131,26 @@ void CanvasWidget::finishStroke() {
         return;
     }
     if (gas::StrokeTool* active = strokeTool()) {
-        // The stabilizer lags behind the pointer; finish at the release point.
-        if (const auto tail = smoother_.finish()) {
-            active->moveTo(*editImage_, tail->pos, tail->pressure);
+        if (streamline_ > 0.0 && rawStroke_.size() >= 3) {
+            // StreamLine: throw the live stroke away and redraw it along the smoothed path.
+            active->end();
+            smoother_.finish();
+            const std::vector<gas::StrokeSample> path = gas::streamlinePath(rawStroke_, streamline_);
+            document_->revertEdit();
+            active->begin(*editImage_, path.front().pos, path.front().pressure);
+            for (std::size_t i = 1; i < path.size(); ++i) {
+                active->moveTo(*editImage_, path[i].pos, path[i].pressure);
+            }
+            active->end();
+        } else {
+            // The stabilizer lags behind the pointer; finish at the release point.
+            if (const auto tail = smoother_.finish()) {
+                active->moveTo(*editImage_, tail->pos, tail->pressure);
+            }
+            active->end();
         }
-        active->end();
     }
+    rawStroke_.clear();
     editImage_ = nullptr;
     std::string label = toolLabel(tool_).toStdString();
     if (document_->editingMask()) {
@@ -197,6 +211,8 @@ gas::BrushSettings& CanvasWidget::brushSettings(Tool tool) {
 }
 
 void CanvasWidget::setDocument(gas::Document* document) {
+    lastStrokeEnd_.reset();
+    lineDrag_.reset();
     if (document_) {
         finishStroke();
         if (transform_) {
@@ -303,6 +319,9 @@ void CanvasWidget::paintGL() {
     if (!document_) {
         return;
     }
+    if (symmetryDocSize_ != QSize(document_->width(), document_->height())) {
+        resetSymmetryCenter(); // new document, crop, or undo of a crop
+    }
 
     const QRectF canvasRect(toQt(viewport_.docToScreen({0, 0})),
                             toQt(viewport_.docToScreen({static_cast<double>(document_->width()),
@@ -343,6 +362,8 @@ void CanvasWidget::paintGL() {
     } else {
         drawSelection(p);
     }
+    drawSymmetryGuides(p);
+    drawLinePreview(p);
     drawSelectionPreview(p);
     drawBrushOutline(p);
 }
@@ -717,11 +738,38 @@ void CanvasWidget::mousePressEvent(QMouseEvent* event) {
         }
         break;
     default:
+        if (symmetry_.enabled() && nearSymmetryHandle(event->position())) {
+            draggingSymmetry_ = true; // move the mirror centre instead of painting
+            break;
+        }
+        strokeTool()->setSymmetry(symmetry_);
+        if (lineMode_ || (event->modifiers() & Qt::ControlModifier)) {
+            const gas::PointF start = docAt(event->position());
+            lineDrag_ = LineDrag{start, start, start};
+            break;
+        }
+        if ((event->modifiers() & Qt::ShiftModifier) && lastStrokeEnd_) {
+            // Shift+click: straight segment from the previous stroke's end, then keep drawing.
+            if (gas::TiledImage* img = beginEdit()) {
+                editImage_ = img;
+                smoother_.setSmoothing(0.0);
+                const gas::PointF at = docAt(event->position());
+                strokeTool()->begin(*img, *lastStrokeEnd_, 1.0);
+                strokeTool()->moveTo(*img, at, pressureOf(event));
+                smoother_.begin({at, pressureOf(event)});
+                rawStroke_ = {{*lastStrokeEnd_, 1.0}, {at, pressureOf(event)}};
+                lastStrokeEnd_ = at;
+                document_->syncEdit();
+            }
+            break;
+        }
         if (gas::TiledImage* img = beginEdit()) {
             editImage_ = img;
             const bool brushLike = usesBrushSettings(tool_);
-            smoother_.setSmoothing(brushLike ? brushSettings(tool_).smoothing : 0.0);
+            // StreamLine also smooths live, so the preview is close to the final stroke.
+            smoother_.setSmoothing(std::max(brushLike ? brushSettings(tool_).smoothing : 0.0, streamline_ * 0.7));
             const gas::StrokeSample s = smoother_.begin({docAt(event->position()), pressureOf(event)});
+            rawStroke_ = {{docAt(event->position()), pressureOf(event)}};
             strokeTool()->begin(*img, s.pos, s.pressure);
             document_->syncEdit();
         }
@@ -761,9 +809,19 @@ void CanvasWidget::mouseMoveEvent(QMouseEvent* event) {
         }
     } else if (picking_ && document_) {
         pickColorAt(event->position());
+    } else if (lineDrag_) {
+        lineDrag_->raw = docAt(event->position());
+        updateLineEnd(event->modifiers());
+    } else if (draggingSymmetry_ && document_) {
+        const gas::PointF d = docAt(event->position());
+        const auto snap = [](double v, int max) { return std::clamp(std::round(v * 2.0) / 2.0, 0.0, double(max)); };
+        symmetry_.center = {snap(d.x, document_->width()), snap(d.y, document_->height())};
     } else if (editImage_) {
-        const gas::StrokeSample s = smoother_.add({docAt(event->position()), pressureOf(event)});
+        const gas::StrokeSample raw{docAt(event->position()), pressureOf(event)};
+        rawStroke_.push_back(raw);
+        const gas::StrokeSample s = smoother_.add(raw);
         strokeTool()->moveTo(*editImage_, s.pos, s.pressure);
+        lastStrokeEnd_ = docAt(event->position());
         document_->syncEdit(); // push the clipped result into the layer for display
     }
     update(); // also repaints the brush outline
@@ -791,7 +849,139 @@ void CanvasWidget::mouseReleaseEvent(QMouseEvent* event) {
         return;
     }
     picking_ = false;
+    draggingSymmetry_ = false;
+    if (lineDrag_) {
+        commitLine();
+        return;
+    }
+    if (editImage_) {
+        lastStrokeEnd_ = docAt(event->position());
+    }
     finishStroke();
+}
+
+void CanvasWidget::setLineMode(bool on) {
+    lineMode_ = on;
+    update();
+}
+
+void CanvasWidget::updateLineEnd(Qt::KeyboardModifiers mods) {
+    if (!lineDrag_) {
+        return;
+    }
+    lineDrag_->end = (mods & Qt::ShiftModifier) ? gas::snapAngle(lineDrag_->start, lineDrag_->raw, 15.0)
+                                                : lineDrag_->raw;
+    update();
+}
+
+// Paints the previewed line as one stroke (one undo step).
+void CanvasWidget::commitLine() {
+    const LineDrag line = *lineDrag_;
+    lineDrag_.reset();
+    gas::StrokeTool* tool = strokeTool();
+    gas::TiledImage* img = tool ? beginEdit() : nullptr;
+    if (!img) {
+        update();
+        return;
+    }
+    tool->begin(*img, line.start, 1.0);
+    tool->moveTo(*img, line.end, 1.0);
+    tool->end();
+    lastStrokeEnd_ = line.end;
+    std::string label = CanvasWidget::tr("Line").toStdString();
+    if (document_->editingMask()) {
+        label += " (Mask)";
+    }
+    if (document_->endEdit(label)) {
+        Q_EMIT documentEdited();
+    }
+    update();
+}
+
+// The pending straight line (and its mirror copies) at the brush's width.
+void CanvasWidget::drawLinePreview(QPainter& p) const {
+    if (!lineDrag_ || !document_) {
+        return;
+    }
+    const gas::BrushTool* brush = brushTool();
+    const double width = std::max(1.0, (brush ? brush->effectiveDiameter() : 1.0) * viewport_.zoom());
+    const bool paints = tool_ == Tool::Pencil || tool_ == Tool::Brush;
+    QColor colour = paints ? QColor(foreground_.r, foreground_.g, foreground_.b, 150) : QColor(128, 128, 128, 140);
+    p.save();
+    p.setRenderHint(QPainter::Antialiasing, true);
+    for (const gas::SymmetryCopy& copy : symmetry_.copies()) {
+        const QPointF a = toQt(viewport_.docToScreen(copy.map(lineDrag_->start, symmetry_.center)));
+        const QPointF b = toQt(viewport_.docToScreen(copy.map(lineDrag_->end, symmetry_.center)));
+        p.setPen(QPen(colour, width, Qt::SolidLine, Qt::RoundCap));
+        p.drawLine(a, b);
+        p.setPen(QPen(QColor(0, 0, 0, 120), 1.0, Qt::DashLine));
+        p.drawLine(a, b); // thin centre line so pale colours still show
+    }
+    p.restore();
+}
+
+void CanvasWidget::setSymmetryMode(gas::SymmetryMode mode) {
+    symmetry_.mode = mode;
+    update();
+}
+
+void CanvasWidget::setSymmetrySegments(int segments) {
+    symmetry_.segments = std::clamp(segments, gas::Symmetry::kMinSegments, gas::Symmetry::kMaxSegments);
+    update();
+}
+
+void CanvasWidget::resetSymmetryCenter() {
+    if (!document_) {
+        return;
+    }
+    symmetryDocSize_ = QSize(document_->width(), document_->height());
+    symmetry_.center = {document_->width() / 2.0, document_->height() / 2.0};
+    update();
+}
+
+bool CanvasWidget::nearSymmetryHandle(QPointF widgetPos) const {
+    return distance(toQt(viewport_.docToScreen(symmetry_.center)), widgetPos) <= 8.0;
+}
+
+// Dashed mirror axes (or the sector lines of radial modes) and the centre handle.
+void CanvasWidget::drawSymmetryGuides(QPainter& p) const {
+    if (!document_ || !symmetry_.enabled()) {
+        return;
+    }
+    const QPointF c = toQt(viewport_.docToScreen(symmetry_.center));
+    const double len = std::hypot(document_->width(), document_->height()) * viewport_.zoom();
+    QVector<QLineF> lines;
+    const auto ray = [&](double angle) { lines << QLineF(c, c + QPointF(std::cos(angle), std::sin(angle)) * len); };
+    constexpr double pi = std::numbers::pi;
+    switch (symmetry_.mode) {
+    case gas::SymmetryMode::Vertical: ray(-pi / 2); ray(pi / 2); break;
+    case gas::SymmetryMode::Horizontal: ray(0); ray(pi); break;
+    case gas::SymmetryMode::Quad: for (int k = 0; k < 4; ++k) ray(k * pi / 2); break;
+    default: {
+        const int n = std::clamp(symmetry_.segments, gas::Symmetry::kMinSegments, gas::Symmetry::kMaxSegments);
+        for (int k = 0; k < n; ++k) {
+            ray(-pi / 2 + 2 * pi * k / n);
+        }
+        break;
+    }
+    }
+    const QRectF canvasRect(toQt(viewport_.docToScreen({0, 0})),
+                            toQt(viewport_.docToScreen({double(document_->width()), double(document_->height())})));
+    p.save();
+    p.setClipRect(canvasRect);
+    p.setRenderHint(QPainter::Antialiasing, true);
+    QPen dark(QColor(0, 0, 0, 150), 1.0, Qt::DashLine);
+    QPen light(QColor(80, 200, 255, 220), 1.0, Qt::DashLine);
+    light.setDashOffset(3); // interleave so the line reads on any colour
+    p.setPen(dark);
+    p.drawLines(lines);
+    p.setPen(light);
+    p.drawLines(lines);
+    p.setClipping(false);
+    p.setPen(QPen(QColor(0, 0, 0, 180), 1.0));
+    p.setBrush(QColor(80, 200, 255, 200));
+    p.drawEllipse(c, 5.0, 5.0);
+    p.restore();
 }
 
 void CanvasWidget::mouseDoubleClickEvent(QMouseEvent* event) {
@@ -833,6 +1023,12 @@ void CanvasWidget::keyPressEvent(QKeyEvent* event) {
         case Qt::Key_Down: transform_->offset.y += step; applyTransform(); return;
         default: break;
         }
+    } else if (lineDrag_ && event->key() == Qt::Key_Escape) {
+        lineDrag_.reset();
+        update();
+        return;
+    } else if (lineDrag_ && event->key() == Qt::Key_Shift) {
+        updateLineEnd(event->modifiers() | Qt::ShiftModifier);
     } else if (dragging_ && event->key() == Qt::Key_Escape) {
         dragging_ = false;
         dragPoints_.clear();
@@ -843,6 +1039,9 @@ void CanvasWidget::keyPressEvent(QKeyEvent* event) {
 }
 
 void CanvasWidget::keyReleaseEvent(QKeyEvent* event) {
+    if (lineDrag_ && event->key() == Qt::Key_Shift) {
+        updateLineEnd(event->modifiers() & ~Qt::KeyboardModifiers(Qt::ShiftModifier));
+    }
     if (event->key() == Qt::Key_Space && !event->isAutoRepeat()) {
         spaceHeld_ = false;
         updateCursorShape();

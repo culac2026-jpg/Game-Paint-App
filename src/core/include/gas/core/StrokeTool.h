@@ -1,6 +1,7 @@
 #pragma once
 
 #include "gas/core/Geometry.h"
+#include "gas/core/Symmetry.h"
 
 namespace gas {
 
@@ -17,6 +18,13 @@ public:
     virtual void moveTo(TiledImage& image, PointF p, double pressure = 1.0) = 0;
     virtual void end() = 0;
     virtual bool isStroking() const = 0;
+
+    // Mirror painting; read when a stroke begins.
+    void setSymmetry(const Symmetry& symmetry) { symmetry_ = symmetry; }
+    const Symmetry& symmetry() const { return symmetry_; }
+
+private:
+    Symmetry symmetry_;
 };
 
 } // namespace gas

@@ -4,6 +4,8 @@ add_library(gas_core STATIC
     src/Viewport.cpp
     src/Document.cpp
     src/Effects.cpp
+    src/Symmetry.cpp
+    src/StrokeSmoother.cpp
     src/Blend.cpp
     src/Brush.cpp
     src/BrushPresets.cpp

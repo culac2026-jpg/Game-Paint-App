@@ -5,6 +5,7 @@
 #include "gas/core/StrokeTool.h"
 
 #include <optional>
+#include <vector>
 
 namespace gas {
 
@@ -26,8 +27,12 @@ public:
     bool isStroking() const override { return last_.has_value(); }
 
 private:
+    void plot(TiledImage& image, Point p);
+
     Rgba8 color_ = Rgba8::black();
     std::optional<Point> last_;
+    std::vector<SymmetryCopy> copies_{SymmetryCopy{}};
+    bool gridAligned_ = true;
 };
 
 } // namespace gas

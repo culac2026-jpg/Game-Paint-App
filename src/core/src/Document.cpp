@@ -487,6 +487,26 @@ TiledImage* Document::beginEdit() {
     return &*edit_->scratch;
 }
 
+void Document::revertEdit() {
+    if (!edit_) {
+        return;
+    }
+    const auto restore = [&](TiledImage& img) {
+        for (int ty = 0; ty < img.tilesY(); ++ty) {
+            for (int tx = 0; tx < img.tilesX(); ++tx) {
+                const TiledImage::TilePtr& before = edit_->before[static_cast<std::size_t>(ty * img.tilesX() + tx)];
+                if (img.sharedTile(tx, ty) != before) {
+                    img.setTile(tx, ty, before);
+                }
+            }
+        }
+    };
+    restore(targetImage(edit_->layer, edit_->mask));
+    if (edit_->scratch) {
+        restore(*edit_->scratch);
+    }
+}
+
 void Document::syncEdit() {
     if (!edit_ || !edit_->scratch) {
         return;

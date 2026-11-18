@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cmath>
 #include <optional>
+#include <vector>
 
 namespace gas {
 
@@ -60,5 +61,12 @@ private:
     std::optional<StrokeSample> current_;
     std::optional<StrokeSample> last_;
 };
+
+// StreamLine: the whole stroke smoothed after the fact (non-causal, so no lag
+// and no drift towards the start). The path is resampled every pixel and
+// Gaussian-smoothed with a window of up to `strength` (0..1) x 40 px that
+// shrinks near the ends, so both endpoints stay exactly where they were.
+// Returns `raw` unchanged when strength is 0 or there are too few points.
+std::vector<StrokeSample> streamlinePath(const std::vector<StrokeSample>& raw, double strength);
 
 } // namespace gas

@@ -319,17 +319,19 @@ void BrushTool::begin(TiledImage& image, PointF p, double pressure) {
     rng_ = seed_;
     strokeSeed_ = seed_ * 0xD1B54A32D192ED03ull + 1;
     dabIndex_ = 0;
-    paint_ = {double(color_.r), double(color_.g), double(color_.b)};
+    copies_ = symmetry().copies();
+    paints_.assign(copies_.size(), {double(color_.r), double(color_.g), double(color_.b)});
     if (mode_ == BrushMode::Smudge) {
         carriedSize_ = 2 * static_cast<int>(std::ceil(effectiveDiameter() * std::numbers::sqrt2 / 2.0 + 2.0)) + 1;
-        carried_.assign(static_cast<std::size_t>(carriedSize_) * static_cast<std::size_t>(carriedSize_), Premul{});
-        carriedLoaded_ = false;
+        carried_.assign(copies_.size(),
+                        std::vector<Premul>(static_cast<std::size_t>(carriedSize_) * static_cast<std::size_t>(carriedSize_)));
+        carriedLoaded_.assign(copies_.size(), 0);
     }
     splitmix(seed_); // the next stroke gets fresh randomness
     last_ = p;
     lastPressure_ = pressure;
     const Dab dab = makeDab(p, pressure, 0.0);
-    stampDab(image, dab);
+    stampSymmetric(image, dab);
     distanceToNextDab_ = stepAfter(dab);
 }
 
@@ -354,7 +356,7 @@ void BrushTool::moveTo(TiledImage& image, PointF p, double pressure) {
         const double t = travelled / length;
         const Dab dab = makeDab({last_->x + dx * t, last_->y + dy * t},
                                 lastPressure_ + (pressure - lastPressure_) * t, direction);
-        stampDab(image, dab);
+        stampSymmetric(image, dab);
         travelled += stepAfter(dab);
     }
     distanceToNextDab_ = travelled - length;
@@ -381,6 +383,18 @@ Rgba8 BrushTool::originalPixel(const TiledImage& image, int x, int y) const {
     const auto it = strokeTiles_.find(tileKey(x / kTile, y / kTile));
     const TiledImage::TilePtr tile = it != strokeTiles_.end() ? it->second.original : image.sharedTile(x / kTile, y / kTile);
     return tile ? tile->pixels[static_cast<std::size_t>(TiledImage::pixelIndex(x, y))] : Rgba8::transparent();
+}
+
+void BrushTool::stampSymmetric(TiledImage& image, const Dab& dab) {
+    const PointF center = symmetry().center;
+    for (std::size_t k = 0; k < copies_.size(); ++k) {
+        Dab copy = dab;
+        copy.center = copies_[k].map(dab.center, center);
+        copy.angle = copies_[k].mapAngle(dab.angle);
+        copy.flipped = copies_[k].flip;
+        copyIndex_ = k;
+        stampDab(image, copy); // one shared coverage mask: overlapping copies don't stack
+    }
 }
 
 void BrushTool::stampDab(TiledImage& image, const Dab& dab) {
@@ -417,6 +431,9 @@ void BrushTool::stampDab(TiledImage& image, const Dab& dab) {
     const auto local = [&](double px, double py, double& lx, double& ly) {
         lx = cs * px + sn * py;
         ly = (-sn * px + cs * py) / roundness;
+        if (dab.flipped) {
+            ly = -ly;
+        }
     };
     const auto tipCoverage = [&](double ox, double oy) -> double {
         if (circle) {
@@ -501,11 +518,12 @@ void BrushTool::stampDab(TiledImage& image, const Dab& dab) {
         const double reload = 1.0 - std::pow(1.0 - 0.3 * (1.0 - mix), step);
         const double sampled[3] = {alpha > 1e-6 ? r / alpha : 0, alpha > 1e-6 ? g / alpha : 0, alpha > 1e-6 ? b / alpha : 0};
         const double base[3] = {double(color_.r), double(color_.g), double(color_.b)};
+        std::array<double, 3>& carriedPaint = paints_[copyIndex_];
         for (std::size_t k = 0; k < 3; ++k) {
-            paint_[k] += (sampled[k] - paint_[k]) * pickup;
-            paint_[k] += (base[k] - paint_[k]) * reload; // the brush slowly reloads
+            carriedPaint[k] += (sampled[k] - carriedPaint[k]) * pickup;
+            carriedPaint[k] += (base[k] - carriedPaint[k]) * reload; // the brush slowly reloads
         }
-        paint = {clampByte(paint_[0]), clampByte(paint_[1]), clampByte(paint_[2]), color_.a};
+        paint = {clampByte(carriedPaint[0]), clampByte(carriedPaint[1]), clampByte(carriedPaint[2]), color_.a};
     }
 
     // 3. Paint / erase, one tile at a time so per-tile lookups happen once.
@@ -607,18 +625,20 @@ void BrushTool::retouchDab(TiledImage& image, const Dab& dab, int x0, int y0, in
 
     // Smudge: the tip carries colour; each dab blends it into the canvas and
     // picks some of the canvas up (strength = how far the colour travels).
-    const int cx = static_cast<int>(std::floor(dab.center.x)), cy = static_cast<int>(std::floor(dab.center.y));
+    // Offset of each pixel centre from the dab centre, rounded symmetrically
+    // (lround), so mirror copies index mirrored buffer cells.
     const int half = carriedSize_ / 2;
     for (int y = y0; y < y0 + h; ++y) {
         for (int x = x0; x < x0 + w; ++x) {
             const float cov = coverage_[static_cast<std::size_t>((y - y0) * w + (x - x0))];
-            const int kx = x - cx + half, ky = y - cy + half;
+            const int kx = static_cast<int>(std::lround(x + 0.5 - dab.center.x)) + half;
+            const int ky = static_cast<int>(std::lround(y + 0.5 - dab.center.y)) + half;
             if (cov <= 0 || kx < 0 || ky < 0 || kx >= carriedSize_ || ky >= carriedSize_) {
                 continue;
             }
-            Premul& acc = carried_[static_cast<std::size_t>(ky * carriedSize_ + kx)];
+            Premul& acc = carried_[copyIndex_][static_cast<std::size_t>(ky * carriedSize_ + kx)];
             const Premul& s = src[at(x, y)];
-            if (!carriedLoaded_) {
+            if (!carriedLoaded_[copyIndex_]) {
                 acc = s; // the first dab only picks the colour up
                 continue;
             }
@@ -630,7 +650,7 @@ void BrushTool::retouchDab(TiledImage& image, const Dab& dab, int x0, int y0, in
             write(x, y, out);
         }
     }
-    carriedLoaded_ = true;
+    carriedLoaded_[copyIndex_] = 1;
 }
 
 } // namespace gas

@@ -179,6 +179,8 @@ void MainWindow::createActions() {
     documentActions_ << image->addAction(tr("&Crop to Selection"), this, &MainWindow::cropToSelection);
 
     QMenu* view = menuBar()->addMenu(tr("&View"));
+    view->addAction(tr("Reset &Symmetry Centre"), canvas_, &CanvasWidget::resetSymmetryCenter);
+    view->addSeparator();
     view->addAction(tr("Zoom &In"), QKeySequence::ZoomIn, canvas_, &CanvasWidget::zoomIn);
     view->addAction(tr("Zoom &Out"), QKeySequence::ZoomOut, canvas_, &CanvasWidget::zoomOut);
     view->addAction(tr("&Actual Pixels"), QKeySequence(Qt::CTRL | Qt::Key_1), canvas_,
@@ -210,6 +212,22 @@ void MainWindow::createToolBars() {
         toolsMenu->addAction(a);
     }
     toolsMenu->addSeparator();
+    lineModeAction_ = toolsMenu->addAction(tr("Straight &Line"));
+    lineModeAction_->setCheckable(true);
+    lineModeAction_->setShortcut(QKeySequence(Qt::Key_U));
+    lineModeAction_->setToolTip(tr("Straight line mode (U): every drag paints a straight line.\n"
+                                   "Without it: hold Ctrl while dragging for one line.\n"
+                                   "Shift snaps the angle to 15° steps; Shift+click joins the last stroke to the click."));
+    connect(lineModeAction_, &QAction::toggled, canvas_, &CanvasWidget::setLineMode);
+    toolsMenu->addAction(tr("Toggle Stream&Line"), QKeySequence(Qt::Key_Q), this, [this] {
+        if (streamlineBox_->value() > 0) {
+            lastStreamline_ = streamlineBox_->value();
+            streamlineBox_->setValue(0);
+        } else {
+            streamlineBox_->setValue(lastStreamline_);
+        }
+        statusBar()->showMessage(tr("StreamLine %1%").arg(streamlineBox_->value()), 2000);
+    });
     toolsMenu->addAction(tr("Foreground &Color..."), QKeySequence(Qt::Key_C), this,
                          &MainWindow::chooseColor);
     toolsMenu->addAction(tr("&Smaller Brush"), QKeySequence(Qt::Key_BracketLeft), this,
@@ -254,6 +272,32 @@ void MainWindow::createToolBars() {
     antialiasBox_->setFocusPolicy(Qt::NoFocus);
     antialiasBox_->setToolTip(tr("Soft edges for ellipse and lasso selections"));
     selectionOptionActions_ << addLabeled(tr("Mode"), selectionModeBox_) << options->addWidget(antialiasBox_);
+
+    symmetryBox_ = new QComboBox(options);
+    symmetryBox_->setFocusPolicy(Qt::NoFocus);
+    symmetryBox_->setToolTip(tr("Mirror painting. Drag the round handle on the canvas to move the centre."));
+    for (int m = 0; m < gas::kSymmetryModeCount; ++m) {
+        symmetryBox_->addItem(tr(gas::symmetryModeName(static_cast<gas::SymmetryMode>(m)).data()), m);
+    }
+    segmentsBox_ = makeSpinBox(options, gas::Symmetry::kMinSegments, gas::Symmetry::kMaxSegments, QString(),
+                               tr("Number of radial copies"));
+    segmentsBox_->setValue(canvas_->symmetry().segments);
+    auto* lineButton = new QToolButton(options);
+    lineButton->setDefaultAction(lineModeAction_); // its own widget, so hiding it keeps the menu entry
+    lineButton->setFocusPolicy(Qt::NoFocus);
+    streamlineBox_ = makeSpinBox(options, 0, 100, tr("%"),
+                                 tr("StreamLine (Q toggles): smooths hand-drawn strokes into clean curves.\n"
+                                    "The stroke trails the pointer, then is redrawn along a smoothed path on release."));
+    streamlineBox_->setValue(0);
+    connect(streamlineBox_, &QSpinBox::valueChanged, this, [this](int v) { canvas_->setStreamline(v / 100.0); });
+    symmetryOptionActions_ << options->addSeparator() << addLabeled(tr("StreamLine"), streamlineBox_)
+                           << options->addWidget(lineButton) << addLabeled(tr("Symmetry"), symmetryBox_);
+    segmentsOptionActions_ = addLabeled(tr("Segments"), segmentsBox_);
+    connect(symmetryBox_, &QComboBox::currentIndexChanged, this, [this](int i) {
+        canvas_->setSymmetryMode(static_cast<gas::SymmetryMode>(symmetryBox_->itemData(i).toInt()));
+        syncToolOptions();
+    });
+    connect(segmentsBox_, &QSpinBox::valueChanged, canvas_, &CanvasWidget::setSymmetrySegments);
     connect(selectionModeBox_, &QComboBox::currentIndexChanged, this, [this](int i) {
         canvas_->setSelectionOp(static_cast<gas::Selection::Op>(selectionModeBox_->itemData(i).toInt()));
     });
@@ -311,6 +355,15 @@ void MainWindow::syncToolOptions() {
     }
     for (QAction* a : selectionOptionActions_) {
         a->setVisible(isSelect && !transforming);
+    }
+    const bool strokeTool = (isBrush || tool == Tool::Pencil) && !transforming;
+    const gas::SymmetryMode symmetryMode = canvas_->symmetry().mode;
+    const bool radial = symmetryMode == gas::SymmetryMode::Radial || symmetryMode == gas::SymmetryMode::Kaleidoscope;
+    for (QAction* a : symmetryOptionActions_) {
+        a->setVisible(strokeTool);
+    }
+    for (QAction* a : segmentsOptionActions_) {
+        a->setVisible(strokeTool && radial);
     }
     for (QAction* a : transformOptionActions_) {
         a->setVisible(tool == Tool::Move || transforming);

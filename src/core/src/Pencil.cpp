@@ -2,11 +2,16 @@
 
 #include "gas/core/TiledImage.h"
 
+#include <algorithm>
 #include <cstdlib>
 
 namespace gas {
 
-void drawLine(TiledImage& image, Point a, Point b, Rgba8 color) {
+namespace {
+
+// Bresenham from a to b inclusive, calling fn for each pixel.
+template <typename Fn>
+void forEachLinePixel(Point a, Point b, Fn&& fn) {
     const int dx = std::abs(b.x - a.x);
     const int dy = -std::abs(b.y - a.y);
     const int sx = a.x < b.x ? 1 : -1;
@@ -14,7 +19,7 @@ void drawLine(TiledImage& image, Point a, Point b, Rgba8 color) {
     int err = dx + dy;
     Point p = a;
     for (;;) {
-        image.setPixel(p, color);
+        fn(p);
         if (p == b) {
             break;
         }
@@ -30,9 +35,25 @@ void drawLine(TiledImage& image, Point a, Point b, Rgba8 color) {
     }
 }
 
+} // namespace
+
+void drawLine(TiledImage& image, Point a, Point b, Rgba8 color) {
+    forEachLinePixel(a, b, [&](Point p) { image.setPixel(p, color); });
+}
+
+// Pixel p and its mirror copies (pixel centres mapped, then floored).
+void PencilTool::plot(TiledImage& image, Point p) {
+    const PointF center = symmetry().center;
+    for (const SymmetryCopy& copy : copies_) {
+        image.setPixel(toPixel(copy.map({p.x + 0.5, p.y + 0.5}, center)), color_);
+    }
+}
+
 void PencilTool::begin(TiledImage& image, PointF pos, double /*pressure*/) {
+    copies_ = symmetry().copies();
+    gridAligned_ = std::all_of(copies_.begin(), copies_.end(), [](const SymmetryCopy& c) { return c.gridAligned(); });
     const Point p = toPixel(pos);
-    image.setPixel(p, color_);
+    plot(image, p);
     last_ = p;
 }
 
@@ -45,7 +66,17 @@ void PencilTool::moveTo(TiledImage& image, PointF pos, double /*pressure*/) {
     if (p == *last_) {
         return;
     }
-    drawLine(image, *last_, p, color_);
+    if (gridAligned_) {
+        // Mirror pixel by pixel, so the copies are exact mirror images.
+        forEachLinePixel(*last_, p, [&](Point q) { plot(image, q); });
+    } else {
+        // Rotated copies: draw each as its own connected line (no gaps).
+        const PointF center = symmetry().center;
+        for (const SymmetryCopy& copy : copies_) {
+            const auto mapped = [&](Point q) { return toPixel(copy.map({q.x + 0.5, q.y + 0.5}, center)); };
+            drawLine(image, mapped(*last_), mapped(p), color_);
+        }
+    }
     last_ = p;
 }
 

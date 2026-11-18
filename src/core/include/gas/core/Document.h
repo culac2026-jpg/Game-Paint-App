@@ -122,6 +122,9 @@ public:
     void syncEdit();
     // Records one undo step named `label` if any pixel changed; returns whether it did.
     bool endEdit(const std::string& label);
+    // Puts the edited image back as it was at beginEdit(); the edit stays open
+    // (used to redraw a stroke, e.g. after StreamLine smoothing).
+    void revertEdit();
     bool isEditing() const { return edit_.has_value(); }
 
     // Clears / fills the selected pixels (the whole layer if nothing is selected).

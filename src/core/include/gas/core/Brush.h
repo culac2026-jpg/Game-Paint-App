@@ -145,10 +145,12 @@ private:
         double diameter;
         double opacity; // 0..1, multiplies the tip coverage
         double angle;   // radians
+        bool flipped = false; // mirror copy: the tip is flipped across its own x axis
     };
 
     Dab makeDab(PointF p, double pressure, double direction);
     double stepAfter(const Dab& dab) const;
+    void stampSymmetric(TiledImage& image, const Dab& dab); // the dab and its mirror copies
     void stampDab(TiledImage& image, const Dab& dab);
     void retouchDab(TiledImage& image, const Dab& dab, int x0, int y0, int w, int h);
     Rgba8 originalPixel(const TiledImage& image, int x, int y) const;
@@ -169,11 +171,14 @@ private:
     std::uint64_t strokeSeed_ = 0; // per-stroke noise seed (particles)
     std::uint64_t dabIndex_ = 0;
     std::vector<float> coverage_;   // per-dab scratch, dab bounding box
-    std::array<double, 3> paint_{}; // wet-mix colour carried by the brush
-    // Smudge: premultiplied colour carried by the tip, centred on the dab.
-    std::vector<std::array<float, 4>> carried_;
+    // Per symmetry copy: index of the copy being stamped, wet-mix colour carried
+    // by the brush, and (smudge) premultiplied colour carried by the tip, centred on the dab.
+    std::vector<SymmetryCopy> copies_{SymmetryCopy{}};
+    std::size_t copyIndex_ = 0;
+    std::vector<std::array<double, 3>> paints_;
+    std::vector<std::vector<std::array<float, 4>>> carried_;
+    std::vector<char> carriedLoaded_;
     int carriedSize_ = 0;
-    bool carriedLoaded_ = false;
 };
 
 } // namespace gas

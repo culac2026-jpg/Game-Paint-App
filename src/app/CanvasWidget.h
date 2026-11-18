@@ -1,6 +1,7 @@
 #pragma once
 
 #include <gas/core/Brush.h>
+#include <gas/core/Symmetry.h>
 #include <gas/core/Pencil.h>
 #include <gas/core/Selection.h>
 #include <gas/core/StrokeSmoother.h>
@@ -50,6 +51,24 @@ public:
 
     // Settings of the Brush or Eraser tool (each keeps its own).
     gas::BrushSettings& brushSettings(Tool tool);
+
+    // Mirror painting for the stroke tools. The centre starts in the middle of
+    // the canvas and can be dragged by its handle (snaps to half pixels).
+    const gas::Symmetry& symmetry() const { return symmetry_; }
+    void setSymmetryMode(gas::SymmetryMode mode);
+    void setSymmetrySegments(int segments);
+    void resetSymmetryCenter();
+
+    // Straight lines for the stroke tools: in line mode (or with Ctrl held at
+    // the press) a drag previews a line and paints it on release; Shift snaps
+    // it to 15-degree steps. Shift+click joins the last stroke's end to the click.
+    bool lineMode() const { return lineMode_; }
+    void setLineMode(bool on);
+
+    // StreamLine (0..1) for the stroke tools: the stroke trails the pointer
+    // while drawing and is redrawn along a fully smoothed path on release.
+    double streamline() const { return streamline_; }
+    void setStreamline(double strength) { streamline_ = std::clamp(strength, 0.0, 1.0); }
 
     int fillTolerance() const { return fillTolerance_; }
     void setFillTolerance(int tolerance) { fillTolerance_ = tolerance; }
@@ -130,6 +149,11 @@ private:
     void syncDirtyTiles();
     void syncDocumentSize();
     void drawBrushOutline(QPainter& p) const;
+    void drawSymmetryGuides(QPainter& p) const;
+    void drawLinePreview(QPainter& p) const;
+    void updateLineEnd(Qt::KeyboardModifiers mods);
+    void commitLine();
+    bool nearSymmetryHandle(QPointF widgetPos) const;
     void drawSelection(QPainter& p);
     void drawSelectionPreview(QPainter& p) const;
     void drawTransformBox(QPainter& p) const;
@@ -159,6 +183,17 @@ private:
     gas::BrushTool blur_{gas::BrushMode::Blur};
     int fillTolerance_ = 0;
     bool picking_ = false;
+    gas::Symmetry symmetry_;
+    QSize symmetryDocSize_;        // canvas size the centre was set for (recentred when it changes)
+    bool draggingSymmetry_ = false;
+    bool lineMode_ = false;
+    double streamline_ = 0.0;
+    std::vector<gas::StrokeSample> rawStroke_; // pointer samples of the current stroke (for StreamLine)
+    struct LineDrag {
+        gas::PointF start, raw, end; // raw = pointer, end = after snapping
+    };
+    std::optional<LineDrag> lineDrag_;
+    std::optional<gas::PointF> lastStrokeEnd_; // for Shift+click
     gas::StrokeSmoother smoother_;
     double tabletPressure_ = 1.0; // from the latest tablet event
 
