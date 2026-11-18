@@ -1,5 +1,6 @@
 #include "gas/core/StrokeSmoother.h"
 
+#include <algorithm>
 #include <cmath>
 
 namespace gas {
@@ -55,9 +56,63 @@ std::vector<StrokeSample> gaussian(const std::vector<StrokeSample>& in, int radi
     return out;
 }
 
+// One Gaussian pass over a closed loop (indices wrap), so there is no seam.
+std::vector<StrokeSample> gaussianCyclic(const std::vector<StrokeSample>& in, int radius) {
+    const int n = static_cast<int>(in.size());
+    radius = std::min(radius, (n - 1) / 2);
+    const double sigma = std::max(1.0, radius / 2.0);
+    std::vector<StrokeSample> out(in.size());
+    for (int i = 0; i < n; ++i) {
+        double sx = 0, sy = 0, sp = 0, sw = 0;
+        for (int k = -radius; k <= radius; ++k) {
+            const double wk = std::exp(-0.5 * (k / sigma) * (k / sigma));
+            const StrokeSample& s = in[static_cast<std::size_t>(((i + k) % n + n) % n)];
+            sx += wk * s.pos.x;
+            sy += wk * s.pos.y;
+            sp += wk * s.pressure;
+            sw += wk;
+        }
+        out[static_cast<std::size_t>(i)] = {{sx / sw, sy / sw}, sp / sw};
+    }
+    return out;
+}
+
+double distance(const PointF& a, const PointF& b) { return std::hypot(a.x - b.x, a.y - b.y); }
+
+// If the stroke comes back to where it started (a closed shape), returns the
+// index of the last point to keep: the tail point nearest the start, so a
+// small overshoot past the start is dropped. Returns 0 for an open stroke.
+std::size_t closingPoint(const std::vector<StrokeSample>& pts, double closeDistance) {
+    const PointF start = pts.front().pos;
+    double length = 0, farthest = 0;
+    for (std::size_t i = 1; i < pts.size(); ++i) {
+        length += distance(pts[i - 1].pos, pts[i].pos);
+        farthest = std::max(farthest, distance(pts[i].pos, start));
+    }
+    if (farthest < 3 * closeDistance || length < 8 * closeDistance) {
+        return 0; // too small to be a deliberate loop
+    }
+    // Only the last quarter of the stroke (by length) may close it.
+    std::size_t best = 0;
+    double bestDist = closeDistance, travelled = 0;
+    for (std::size_t i = 1; i < pts.size(); ++i) {
+        travelled += distance(pts[i - 1].pos, pts[i].pos);
+        if (travelled < 0.75 * length) {
+            continue;
+        }
+        const double d = distance(pts[i].pos, start);
+        if (d <= bestDist) {
+            bestDist = d;
+            best = i;
+        }
+    }
+    return best;
+}
+
 } // namespace
 
-std::vector<StrokeSample> streamlinePath(const std::vector<StrokeSample>& raw, double strength) {
+std::vector<StrokeSample> streamlinePath(const std::vector<StrokeSample>& raw, double strength,
+                                         double closeDistance) {
     strength = std::clamp(strength, 0.0, 1.0);
     std::vector<StrokeSample> pts;
     for (const StrokeSample& s : raw) {
@@ -68,6 +123,20 @@ std::vector<StrokeSample> streamlinePath(const std::vector<StrokeSample>& raw, d
     const int radius = static_cast<int>(std::lround(strength * 40.0));
     if (pts.size() < 3 || radius < 1) {
         return raw;
+    }
+    // A stroke that ends where it began closes the shape: smooth it as a loop
+    // so the join is as smooth as the rest, with no kink or gap.
+    closeDistance = std::max(closeDistance, 0.5 * radius);
+    if (const std::size_t last = closingPoint(pts, closeDistance)) {
+        pts.resize(last + 1);
+        pts.push_back(pts.front()); // the closing segment, resampled like the others
+        pts = resample(pts, 1.0);
+        pts.pop_back();             // == front: the loop wraps instead
+        if (pts.size() >= 3) {
+            pts = gaussianCyclic(gaussianCyclic(pts, radius), radius);
+            pts.push_back(pts.front()); // end exactly on the start
+            return pts;
+        }
     }
     pts = resample(pts, 1.0);
     pts = gaussian(pts, radius);

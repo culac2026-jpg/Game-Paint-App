@@ -66,7 +66,13 @@ private:
 // and no drift towards the start). The path is resampled every pixel and
 // Gaussian-smoothed with a window of up to `strength` (0..1) x 40 px that
 // shrinks near the ends, so both endpoints stay exactly where they were.
+// A stroke whose last quarter returns within max(closeDistance, window / 2)
+// px of its start is a closed shape (the canvas passes a distance that looks
+// closed at the current zoom and brush size): any overshoot past the start is
+// trimmed and the loop is smoothed cyclically, ending exactly on its
+// (smoothed) first point, so the join has no gap or kink.
 // Returns `raw` unchanged when strength is 0 or there are too few points.
-std::vector<StrokeSample> streamlinePath(const std::vector<StrokeSample>& raw, double strength);
+std::vector<StrokeSample> streamlinePath(const std::vector<StrokeSample>& raw, double strength,
+                                         double closeDistance = 12.0);
 
 } // namespace gas

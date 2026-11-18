@@ -94,3 +94,74 @@ TEST(StreamLine, RevertEditRedrawsAsOneStep) {
     doc.revertEdit();
     EXPECT_FALSE(doc.endEdit("Brush"));
 }
+
+namespace {
+
+// A hand-drawn loop: wobbly circle of radius 60 around (100, 100), starting at
+// angle 0 and running `endDegrees` (> 360 = overshoots past the start).
+std::vector<StrokeSample> wobblyLoop(int endDegrees, double gapRadius = 0) {
+    std::vector<StrokeSample> raw;
+    for (int i = 0; i <= endDegrees; i += 3) {
+        const double a = i * 3.14159265358979 / 180;
+        const double r = 60 + ((i / 3) % 2 ? 2.5 : -2.5) + gapRadius * i / endDegrees;
+        raw.push_back({{100 + r * std::cos(a), 100 + r * std::sin(a)}, 1.0});
+    }
+    return raw;
+}
+
+// Largest change of direction between consecutive 4 px chords, in degrees.
+double sharpestTurn(const std::vector<StrokeSample>& path, bool wrap) {
+    std::vector<gas::PointF> p;
+    for (std::size_t i = 0; i < path.size(); i += 4) {
+        p.push_back(path[i].pos);
+    }
+    if (wrap) {
+        p.push_back(p[0]);
+        p.push_back(p[1]);
+    }
+    double worst = 0;
+    for (std::size_t i = 2; i < p.size(); ++i) {
+        const double a1 = std::atan2(p[i - 1].y - p[i - 2].y, p[i - 1].x - p[i - 2].x);
+        const double a2 = std::atan2(p[i].y - p[i - 1].y, p[i].x - p[i - 1].x);
+        double d = std::abs(a2 - a1) * 180 / 3.14159265358979;
+        d = std::min(d, 360 - d);
+        worst = std::max(worst, d);
+    }
+    return worst;
+}
+
+} // namespace
+
+TEST(StreamLine, ClosedShapeJoinsSmoothly) {
+    // Ends 5 px short of the start (a small gap) and 25 deg past it (overshoot).
+    for (const auto& raw : {wobblyLoop(357, -5), wobblyLoop(385)}) {
+        const auto smooth = gas::streamlinePath(raw, 0.5);
+        ASSERT_GT(smooth.size(), 300u);
+        // The stroke ends exactly where it starts: no gap.
+        EXPECT_EQ(smooth.back().pos.x, smooth.front().pos.x);
+        EXPECT_EQ(smooth.back().pos.y, smooth.front().pos.y);
+        // Everywhere, including the join, it stays on the drawn ring (the gap
+        // case narrows from r = 60 to 55)...
+        for (const StrokeSample& s : smooth) {
+            const double r = std::hypot(s.pos.x - 100, s.pos.y - 100);
+            EXPECT_GT(r, 54.0);
+            EXPECT_LT(r, 61.5);
+        }
+        // ...and turns gently (a 4 px chord on r = 60 turns ~3.8 deg): no kink at the join.
+        EXPECT_LT(sharpestTurn(smooth, true), 8.0);
+    }
+}
+
+TEST(StreamLine, OpenStrokesStayOpen) {
+    // A three-quarter arc ends far from its start: both ends stay put.
+    const auto raw = wobblyLoop(270);
+    const auto smooth = gas::streamlinePath(raw, 0.5);
+    EXPECT_EQ(smooth.front().pos.x, raw.front().pos.x);
+    EXPECT_EQ(smooth.back().pos.x, raw.back().pos.x);
+    EXPECT_EQ(smooth.back().pos.y, raw.back().pos.y);
+    // A short scribble that returns to its start is not treated as a loop.
+    const std::vector<StrokeSample> tiny{{{0, 0}, 1}, {{6, 0}, 1}, {{6, 6}, 1}, {{1, 1}, 1}};
+    const auto t = gas::streamlinePath(tiny, 1.0);
+    EXPECT_EQ(t.back().pos.x, 1.0);
+    EXPECT_EQ(t.back().pos.y, 1.0);
+}

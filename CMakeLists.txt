@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.21)
 
 project(GameArtStudio
-    VERSION 1.0.0
+    VERSION 1.0.1
     DESCRIPTION "Desktop editor for 2D game assets"
     LANGUAGES C CXX)
 

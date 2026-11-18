@@ -152,7 +152,13 @@ void CanvasWidget::finishStroke() {
             // StreamLine: throw the live stroke away and redraw it along the smoothed path.
             active->end();
             smoother_.finish();
-            const std::vector<gas::StrokeSample> path = gas::streamlinePath(rawStroke_, streamline_);
+            // A stroke that ends near its start closes the shape. "Near" is what
+            // looks closed: about 24 screen px, or the brush size, whichever is more.
+            double closeDistance = 24.0 / viewport_.zoom();
+            if (usesBrushSettings(tool_)) {
+                closeDistance = std::max(closeDistance, brushTool()->effectiveDiameter());
+            }
+            const std::vector<gas::StrokeSample> path = gas::streamlinePath(rawStroke_, streamline_, closeDistance);
             document_->revertEdit();
             active->begin(*editImage_, path.front().pos, path.front().pressure);
             for (std::size_t i = 1; i < path.size(); ++i) {
