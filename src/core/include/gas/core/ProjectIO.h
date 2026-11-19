@@ -49,6 +49,10 @@ class Document;
 //            node f64 x, y, inX, inY, outX, outY
 //     "SLBD" (version 7+) optional, after SLCS: u32 count, then per slice (in
 //            SLCS order) i32 left, top, right, bottom (9-slice border)
+//     "LFRM" (version 8+) optional, after its layer: u32 layerIndex, f64 rectX,
+//            rectY, rectW, rectH, pivotX, pivotY, offsetX, offsetY, angle
+//            (radians), scaleX, scaleY (the layer's remembered transform box
+//            and anchor, see LayerFrame)
 //     "END "
 //   u32 CRC-32 of every preceding byte
 //
@@ -58,9 +62,9 @@ class Document;
 // Only non-empty tiles are stored. Saves are atomic: written to a temporary
 // sibling file, then renamed over the target, so a failed save never damages
 // an existing file. Undo history and the selection are not saved.
-// Version history: 1 = v0.3 (layers), 2 = v0.4 (layer masks), 3 = v0.5 (blend modes), 4 = v0.6 (layer effects), 5 = v0.7 (slices), 6 = v0.8 (animation frames and tags), 7 = v0.9 (vector layers, 9-slice borders). Older versions
+// Version history: 1 = v0.3 (layers), 2 = v0.4 (layer masks), 3 = v0.5 (blend modes), 4 = v0.6 (layer effects), 5 = v0.7 (slices), 6 = v0.8 (animation frames and tags), 7 = v0.9 (vector layers, 9-slice borders), 8 = v1.0.2 (layer transform frames). Older versions
 // still load; newer ones are refused.
-inline constexpr std::uint32_t kProjectFormatVersion = 7;
+inline constexpr std::uint32_t kProjectFormatVersion = 8;
 inline constexpr const char* kProjectExtension = ".gas";
 
 struct IoResult {

@@ -40,6 +40,7 @@ constexpr std::uint32_t kChunkCel = fourcc("CELS");
 constexpr std::uint32_t kChunkTags = fourcc("TAGS");
 constexpr std::uint32_t kChunkVector = fourcc("VECT");
 constexpr std::uint32_t kChunkSliceBorders = fourcc("SLBD");
+constexpr std::uint32_t kChunkLayerFrame = fourcc("LFRM");
 constexpr std::uint32_t kChunkEnd = fourcc("END ");
 constexpr std::uint32_t kMaxVectorItems = 1u << 24; // sanity limit for shape/node counts
 
@@ -367,6 +368,15 @@ IoResult serializeInto(const Document& doc, std::vector<std::uint8_t>& out) {
                 }
             }
             w.chunk(kChunkEffects, ew);
+        }
+        if (const auto& f = layer.props.frame) {
+            ByteWriter fw;
+            fw.u32(static_cast<std::uint32_t>(i));
+            for (double v : {f->rect.x, f->rect.y, f->rect.w, f->rect.h, f->pivot.x, f->pivot.y, f->offset.x,
+                             f->offset.y, f->angle, f->sx, f->sy}) {
+                fw.f64(v);
+            }
+            w.chunk(kChunkLayerFrame, fw);
         }
     }
     if (doc.frameCount() > 1) {
@@ -706,6 +716,17 @@ LoadResult parseProject(const std::uint8_t* data, std::size_t dataSize) {
             shapes = sanitizedShapes(std::move(shapes));
             layers[index].image = rasterizeShapes(shapes, width, height);
             layers[index].vector = std::make_shared<const VectorShapes>(std::move(shapes));
+        } else if (tag == kChunkLayerFrame) {
+            const std::uint32_t index = c.u32();
+            double v[11];
+            for (double& x : v) {
+                x = c.f64();
+            }
+            if (!c.ok() || index >= layers.size()) {
+                return fail("Invalid layer frame");
+            }
+            const LayerFrame f{{v[0], v[1], v[2], v[3]}, {v[4], v[5]}, {v[6], v[7]}, v[8], v[9], v[10]};
+            layers[index].props.frame = sanitizedFrame(f); // unusable values: no frame
         } else if (tag == kChunkSliceBorders) {
             const std::uint32_t count = c.u32();
             if (!c.ok() || count != slices.size()) {

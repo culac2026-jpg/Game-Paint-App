@@ -14,6 +14,7 @@
 #include <QTimer>
 
 #include <memory>
+#include <array>
 #include <optional>
 #include <vector>
 
@@ -112,6 +113,19 @@ public:
     bool beginFreeTransform(); // false (with editRefused) if nothing to transform
     void commitTransform();
     void cancelTransform();
+    // Numeric access for the options bar (angle in degrees, anchor in canvas px).
+    double transformAngle() const;
+    double transformScaleX() const;
+    double transformScaleY() const;
+    gas::PointF transformPivot() const; // where the anchor is now (canvas space)
+    void setTransformAngle(double degrees);
+    void setTransformScale(double sx, double sy);
+    void setTransformPivot(gas::PointF doc); // moves the anchor only, never the pixels
+    void centerTransformPivot();
+    // Steps back/forward through the changes made since the transform began;
+    // false when there is nothing to undo/redo.
+    bool undoTransformStep();
+    bool redoTransformStep();
     gas::Interpolation transformInterpolation() const { return interpolation_; }
     void setTransformInterpolation(gas::Interpolation i) { interpolation_ = i; }
 
@@ -135,6 +149,7 @@ Q_SIGNALS:
     // A tool could not run (e.g. the layer is locked); `reason` is user-facing.
     void editRefused(const QString& reason);
     void transformModeChanged(bool active);
+    void transformChanged(); // any transform parameter, including the anchor
     void selectedSliceChanged(int index);
 
 protected:
@@ -151,20 +166,39 @@ protected:
     void tabletEvent(QTabletEvent* event) override;
 
 private:
-    // Free-transform parameters: M = T(centre + offset) * R(angle) * S(sx, sy) * T(-centre).
+    // Free-transform parameters: M = T(pivot + offset) * R(angle) * S(sx, sy) * T(-pivot).
+    // The pivot (anchor) is a source-space point; it shows at pivot + offset and
+    // rotation/scaling happen around it.
     struct TransformState {
-        gas::IRect source;
+        gas::RectF source; // the box before M (the layer frame's box, or the lifted bounds)
+        // Pixels get M * restInverse: the layer frame's own matrix is undone first,
+        // so the box can start rotated/scaled where it was left.
+        gas::Affine restInverse{};
+        bool wholeLayer = false; // the layer frame applies (and is stored on commit)
+        bool hadFrame = false;
+        gas::PointF pivot{};
         gas::PointF offset{};
         double angle = 0.0;
         double sx = 1.0, sy = 1.0;
-        enum class Drag { None, Move, Scale, Rotate } drag = Drag::None;
-        int corner = -1; // 0..3 = TL, TR, BR, BL while scaling
+        enum class Drag { None, Move, Scale, Rotate, Pivot } drag = Drag::None;
+        int handle = -1; // while scaling: 0..3 = corners TL TR BR BL, 4..7 = edges T R B L
         gas::PointF startDoc{};
         // Values when the drag began.
         gas::PointF offset0{};
         double angle0 = 0.0, sx0 = 1.0, sy0 = 1.0;
         bool oneShot = false; // Move tool: commit on release
     };
+    // In-transform undo/redo (Ctrl+Z/Y while the box is open): one entry per
+    // drag, field edit or nudge.
+    struct TransformParams {
+        gas::PointF pivot, offset;
+        double angle, sx, sy;
+        friend bool operator==(const TransformParams&, const TransformParams&) = default;
+    };
+    TransformParams transformParams() const;
+    void restoreTransformParams(const TransformParams& p);
+    void pushTransformUndo();
+    void movePivotTo(gas::PointF doc); // no undo entry (used while dragging)
 
     bool vectorBusy() const;
     gas::StrokeTool* strokeTool();
@@ -208,7 +242,10 @@ private:
     void updateCursorShape();
 
     gas::Affine transformMatrix() const;
-    std::vector<QPointF> transformCorners() const; // screen space, TL TR BR BL
+    std::vector<QPointF> transformCorners() const; // screen space: corners TL TR BR BL, then edges T R B L
+    std::array<gas::PointF, 8> transformHandlePoints() const; // the same in source space
+    int transformHandleAt(QPointF pos) const;                 // 0..7, or -1
+    bool nearTransformPivot(QPointF pos) const;
     void applyTransform();
     void transformPress(QPointF pos, Qt::KeyboardModifiers mods);
     void transformDrag(QPointF pos, Qt::KeyboardModifiers mods);
@@ -277,6 +314,7 @@ private:
 
     // Transform
     std::optional<TransformState> transform_;
+    std::vector<TransformParams> transformUndo_, transformRedo_;
     gas::Interpolation interpolation_ = gas::Interpolation::Nearest;
 
     bool spaceHeld_ = false;

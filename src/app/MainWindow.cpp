@@ -16,6 +16,10 @@
 #include <gas/core/Slicing.h>
 
 #include <QActionGroup>
+#include <QBuffer>
+#include <QClipboard>
+#include <QGuiApplication>
+#include <QMimeData>
 #include <QCoreApplication>
 #include <QDateTime>
 #include <QDesktopServices>
@@ -29,6 +33,7 @@
 #include <QColorDialog>
 #include <QDialog>
 #include <QDialogButtonBox>
+#include <QDoubleSpinBox>
 #include <QDockWidget>
 #include <QFileDialog>
 #include <QFileInfo>
@@ -191,8 +196,9 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
         onDocumentChanged();
         if (active) {
             statusBar()->showMessage(
-                tr("Transform: drag inside to move, corners to scale (Shift keeps ratio), outside to rotate "
-                   "(Shift snaps 15\u00B0). Enter applies, Esc cancels."));
+                tr("Transform: drag inside to move, corners/edges to scale (Shift keeps ratio), outside to rotate "
+                   "(Shift snaps 15\u00B0). Drag the anchor \u2295 to change the pivot (Shift snaps to "
+                   "corners/edges/centre). Enter applies, Esc cancels."));
         } else {
             statusBar()->clearMessage();
         }
@@ -261,6 +267,12 @@ void MainWindow::createActions() {
     redoAction_ = edit->addAction(tr("&Redo"), this, &MainWindow::redo);
     redoAction_->setShortcuts({QKeySequence(Qt::CTRL | Qt::Key_Y), QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_Z)});
     edit->addSeparator();
+    documentActions_ << edit->addAction(tr("Cu&t"), QKeySequence::Cut, this, [this] { copySelection(false, true); });
+    documentActions_ << edit->addAction(tr("&Copy"), QKeySequence::Copy, this, [this] { copySelection(false, false); });
+    documentActions_ << edit->addAction(tr("Copy &Merged"), QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_C), this,
+                                        [this] { copySelection(true, false); });
+    documentActions_ << edit->addAction(tr("&Paste"), QKeySequence::Paste, this, &MainWindow::paste);
+    edit->addSeparator();
     documentActions_ << edit->addAction(tr("C&lear"), QKeySequence::Delete, this, [this] {
         if (canvas_->tool() == Tool::Slice) {
             canvas_->deleteSelectedSlice(); // Delete removes the selected slice, never pixels
@@ -299,6 +311,11 @@ void MainWindow::createActions() {
                                           &MainWindow::featherSelection);
 
     QMenu* layerMenu = menuBar()->addMenu(tr("&Layer"));
+    documentActions_ << layerMenu->addAction(tr("New Layer via &Copy"), QKeySequence(Qt::CTRL | Qt::Key_J), this,
+                                             [this] { layerFromSelection(false); });
+    documentActions_ << layerMenu->addAction(tr("New Layer via Cu&t"), QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_J),
+                                             this, [this] { layerFromSelection(true); });
+    layerMenu->addSeparator();
     documentActions_ << layerMenu->addAction(tr("New &Vector Layer"), this, [this] {
         settleCanvas();
         runCommand(document_->addVectorLayer());
@@ -437,7 +454,13 @@ void MainWindow::createToolBars() {
     antialiasBox_ = new QCheckBox(tr("Anti-alias"), options);
     antialiasBox_->setFocusPolicy(Qt::NoFocus);
     antialiasBox_->setToolTip(tr("Soft edges for ellipse and lasso selections"));
-    selectionOptionActions_ << addLabeled(tr("Mode"), selectionModeBox_) << options->addWidget(antialiasBox_);
+    auto* transformSelectionButton = new QToolButton(options);
+    transformSelectionButton->setText(tr("Transform"));
+    transformSelectionButton->setToolTip(
+        tr("Move, rotate and scale the selected pixels around a movable anchor (Ctrl+T)"));
+    connect(transformSelectionButton, &QToolButton::clicked, canvas_, [this] { canvas_->beginFreeTransform(); });
+    selectionOptionActions_ << addLabeled(tr("Mode"), selectionModeBox_) << options->addWidget(antialiasBox_)
+                            << options->addWidget(transformSelectionButton);
 
     symmetryBox_ = new QComboBox(options);
     symmetryBox_->setFocusPolicy(Qt::NoFocus);
@@ -478,6 +501,40 @@ void MainWindow::createToolBars() {
     interpolationBox_->setFocusPolicy(Qt::ClickFocus);
     interpolationBox_->setToolTip(tr("Resampling used when a transform is applied"));
     transformOptionActions_ = addLabeled(tr("Resample"), interpolationBox_);
+    const auto makeField = [options](double lo, double hi, int decimals, const QString& suffix, const QString& tip) {
+        auto* box = new QDoubleSpinBox(options);
+        box->setRange(lo, hi);
+        box->setDecimals(decimals);
+        box->setSuffix(suffix);
+        box->setToolTip(tip);
+        box->setKeyboardTracking(false); // apply on Enter / focus out, not per digit
+        box->setFocusPolicy(Qt::ClickFocus);
+        box->setMinimumWidth(78);
+        return box;
+    };
+    xfAngleBox_ = makeField(-360.0, 360.0, 1, QStringLiteral("°"), tr("Rotation around the anchor"));
+    xfScaleXBox_ = makeField(-10000.0, 10000.0, 1, tr("%"), tr("Horizontal scale around the anchor (negative flips)"));
+    xfScaleYBox_ = makeField(-10000.0, 10000.0, 1, tr("%"), tr("Vertical scale around the anchor (negative flips)"));
+    xfPivotXBox_ = makeField(-100000.0, 100000.0, 1, tr(" px"), tr("Anchor X on the canvas"));
+    xfPivotYBox_ = makeField(-100000.0, 100000.0, 1, tr(" px"), tr("Anchor Y on the canvas"));
+    auto* centerPivotButton = new QToolButton(options);
+    centerPivotButton->setText(tr("Center Anchor"));
+    centerPivotButton->setToolTip(tr("Put the anchor back in the middle of the box"));
+    transformApplyActions_ << addLabeled(tr("Angle"), xfAngleBox_) << addLabeled(tr("W"), xfScaleXBox_)
+                           << addLabeled(tr("H"), xfScaleYBox_) << addLabeled(tr("Anchor X"), xfPivotXBox_)
+                           << addLabeled(tr("Y"), xfPivotYBox_) << options->addWidget(centerPivotButton);
+    connect(xfAngleBox_, &QDoubleSpinBox::valueChanged, canvas_, &CanvasWidget::setTransformAngle);
+    const auto applyScale = [this] {
+        canvas_->setTransformScale(xfScaleXBox_->value() / 100.0, xfScaleYBox_->value() / 100.0);
+    };
+    connect(xfScaleXBox_, &QDoubleSpinBox::valueChanged, this, applyScale);
+    connect(xfScaleYBox_, &QDoubleSpinBox::valueChanged, this, applyScale);
+    const auto applyPivot = [this] { canvas_->setTransformPivot({xfPivotXBox_->value(), xfPivotYBox_->value()}); };
+    connect(xfPivotXBox_, &QDoubleSpinBox::valueChanged, this, applyPivot);
+    connect(xfPivotYBox_, &QDoubleSpinBox::valueChanged, this, applyPivot);
+    connect(centerPivotButton, &QToolButton::clicked, canvas_, &CanvasWidget::centerTransformPivot);
+    connect(canvas_, &CanvasWidget::transformChanged, this, &MainWindow::syncTransformFields);
+
     auto* applyButton = new QToolButton(options);
     applyButton->setText(tr("Apply"));
     applyButton->setToolTip(tr("Apply the transform (Enter)"));
@@ -717,6 +774,12 @@ void MainWindow::onDocumentChanged() {
                              ? tr("&Redo %1").arg(QString::fromStdString(document_->redoLabel()))
                              : tr("&Redo"));
     const bool transforming = canvas_->isTransforming();
+    if (transforming) { // Ctrl+Z/Y step through the open transform
+        undoAction_->setEnabled(true);
+        undoAction_->setText(tr("&Undo Transform Step"));
+        redoAction_->setEnabled(true);
+        redoAction_->setText(tr("&Redo Transform Step"));
+    }
     for (QAction* a : documentActions_) {
         a->setEnabled(!transforming);
     }
@@ -792,6 +855,13 @@ void MainWindow::cropToSelection() {
 
 void MainWindow::undo() {
     timelinePanel_->stop();
+    if (canvas_->isTransforming()) {
+        // Steps back through the open transform; past its start, cancels it.
+        if (!canvas_->undoTransformStep()) {
+            canvas_->cancelTransform();
+        }
+        return;
+    }
     if (!canvas_->isBusy() && document_->undo()) {
         onDocumentChanged();
     }
@@ -799,6 +869,10 @@ void MainWindow::undo() {
 
 void MainWindow::redo() {
     timelinePanel_->stop();
+    if (canvas_->isTransforming()) {
+        canvas_->redoTransformStep();
+        return;
+    }
     if (!canvas_->isBusy() && document_->redo()) {
         onDocumentChanged();
     }
@@ -1789,4 +1863,141 @@ void MainWindow::runPluginExporter(int index) {
         return;
     }
     statusBar()->showMessage(tr("Exported %1").arg(QFileInfo(path).fileName()), 3000);
+}
+
+// ---------------------------------------------------------------- clipboard
+
+namespace {
+// Marks clipboard images copied from a canvas: "x,y,width,height" of the
+// canvas position, so pasting back into a canvas of that size keeps it there.
+constexpr char kOriginMime[] = "application/x-gameart-studio-origin";
+} // namespace
+
+void MainWindow::copySelection(bool merged, bool cut) {
+    settleCanvas();
+    if (canvas_->isBusy()) {
+        return;
+    }
+    const gas::TiledImage image = document_->copySelected(merged);
+    const gas::IRect area = document_->selection().bounds().value_or(gas::IRect{0, 0, image.width(), image.height()});
+    const gas::IRect rect = gas::trimmedRect(image, area);
+    if (rect.empty()) {
+        statusBar()->showMessage(tr("Nothing to copy: the selection is empty on this layer"), 4000);
+        return;
+    }
+    const std::vector<gas::Rgba8> pixels = gas::copyPixels(image, rect);
+    QImage q(rect.w, rect.h, QImage::Format_RGBA8888);
+    for (int y = 0; y < rect.h; ++y) {
+        std::memcpy(q.scanLine(y), pixels.data() + static_cast<std::size_t>(y) * static_cast<std::size_t>(rect.w),
+                    static_cast<std::size_t>(rect.w) * 4);
+    }
+    auto* mime = new QMimeData;
+    mime->setImageData(q);
+    QByteArray png; // PNG keeps the alpha channel for other programs
+    QBuffer buffer(&png);
+    buffer.open(QIODevice::WriteOnly);
+    q.save(&buffer, "PNG");
+    mime->setData(QStringLiteral("image/png"), png);
+    mime->setData(QString::fromLatin1(kOriginMime), QStringLiteral("%1,%2,%3,%4")
+                                                        .arg(rect.x)
+                                                        .arg(rect.y)
+                                                        .arg(document_->width())
+                                                        .arg(document_->height())
+                                                        .toLatin1());
+    QGuiApplication::clipboard()->setMimeData(mime);
+    if (!cut) {
+        statusBar()->showMessage(tr("Copied %1×%2 px").arg(rect.w).arg(rect.h), 2500);
+        return;
+    }
+    if (document_->eraseSelected()) {
+        onDocumentChanged();
+        statusBar()->showMessage(tr("Cut %1×%2 px").arg(rect.w).arg(rect.h), 2500);
+    } else {
+        statusBar()->showMessage(
+            tr("Copied, but this layer can't be edited (locked, hidden or vector), so nothing was cut"), 5000);
+    }
+}
+
+void MainWindow::paste() {
+    settleCanvas();
+    if (canvas_->isBusy()) {
+        return;
+    }
+    const QMimeData* mime = QGuiApplication::clipboard()->mimeData();
+    if (!mime) {
+        return;
+    }
+    QImage image;
+    if (mime->hasFormat(QStringLiteral("image/png"))) {
+        image = QImage::fromData(mime->data(QStringLiteral("image/png")), "PNG");
+    }
+    if (image.isNull() && mime->hasImage()) {
+        image = qvariant_cast<QImage>(mime->imageData());
+    }
+    if (image.isNull()) {
+        statusBar()->showMessage(tr("The clipboard holds no image"), 3000);
+        return;
+    }
+    const int w = document_->width();
+    const int h = document_->height();
+    // Back where it was copied from (same canvas size), else centred in the view.
+    int x = 0;
+    int y = 0;
+    const QList<QByteArray> origin = mime->data(QString::fromLatin1(kOriginMime)).split(',');
+    if (origin.size() == 4 && origin[2].toInt() == w && origin[3].toInt() == h) {
+        x = origin[0].toInt();
+        y = origin[1].toInt();
+    } else {
+        const gas::PointF c = canvas_->screenToDocPoint(QPointF(canvas_->width() / 2.0, canvas_->height() / 2.0));
+        x = static_cast<int>(std::lround(c.x - image.width() / 2.0));
+        y = static_cast<int>(std::lround(c.y - image.height() / 2.0));
+        x = image.width() >= w ? 0 : std::clamp(x, 0, w - image.width());
+        y = image.height() >= h ? 0 : std::clamp(y, 0, h - image.height());
+    }
+    gas::TiledImage layer(w, h);
+    blitImage(layer, image, x, y);
+    if (!document_->pasteLayer(tr("Pasted").toStdString(), std::move(layer))) {
+        statusBar()->showMessage(tr("Nothing to paste: the image is empty or outside the canvas"), 3000);
+        return;
+    }
+    onDocumentChanged();
+    const bool clipped = x < 0 || y < 0 || x + image.width() > w || y + image.height() > h;
+    statusBar()->showMessage(clipped ? tr("Pasted as a new layer (clipped to the canvas)") : tr("Pasted as a new layer"),
+                             3000);
+}
+
+void MainWindow::layerFromSelection(bool cut) {
+    settleCanvas();
+    if (canvas_->isBusy()) {
+        return;
+    }
+    if (document_->layerFromSelection(cut)) {
+        onDocumentChanged();
+        return;
+    }
+    const gas::Layer& l = document_->activeLayer();
+    if (cut && (l.vector || l.props.locked || !l.props.visible || document_->editingMask())) {
+        statusBar()->showMessage(
+            tr("Layer via Cut needs a visible, unlocked raster layer (use Layer via Copy instead)"), 5000);
+    } else {
+        statusBar()->showMessage(tr("Nothing to copy: the selection is empty on this layer"), 4000);
+    }
+}
+
+void MainWindow::syncTransformFields() {
+    if (!canvas_->isTransforming()) {
+        return;
+    }
+    const gas::PointF pivot = canvas_->transformPivot();
+    const std::pair<QDoubleSpinBox*, double> values[] = {
+        {xfAngleBox_, canvas_->transformAngle()},
+        {xfScaleXBox_, canvas_->transformScaleX() * 100.0},
+        {xfScaleYBox_, canvas_->transformScaleY() * 100.0},
+        {xfPivotXBox_, pivot.x},
+        {xfPivotYBox_, pivot.y},
+    };
+    for (const auto& [box, value] : values) {
+        const QSignalBlocker block(box);
+        box->setValue(value);
+    }
 }

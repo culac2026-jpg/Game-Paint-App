@@ -367,11 +367,39 @@ bool Document::moveLayer(int from, int to) {
     return true;
 }
 
-bool Document::setLayerProps(int index, const LayerProps& props) {
+std::optional<LayerFrame> sanitizedFrame(const LayerFrame& f) {
+    constexpr double kMaxCoord = 1e6;
+    const double values[] = {f.rect.x, f.rect.y, f.rect.w, f.rect.h, f.pivot.x, f.pivot.y,
+                             f.offset.x, f.offset.y, f.angle, f.sx, f.sy};
+    for (double v : values) {
+        if (!std::isfinite(v) || std::abs(v) > kMaxCoord) {
+            return std::nullopt;
+        }
+    }
+    if (f.rect.w < 0 || f.rect.h < 0) {
+        return std::nullopt;
+    }
+    LayerFrame out = f;
+    const auto clampScale = [](double s) {
+        const double a = std::clamp(std::abs(s), 0.01, 10000.0);
+        return s < 0 ? -a : a;
+    };
+    out.sx = clampScale(f.sx);
+    out.sy = clampScale(f.sy);
+    out.angle = std::remainder(f.angle, 2 * 3.14159265358979323846);
+    return out;
+}
+
+bool Document::setLayerProps(int index, const LayerProps& props) { return setLayerPropsImpl(index, props, true); }
+
+bool Document::setLayerPropsImpl(int index, const LayerProps& props, bool mergeable) {
     if (busy() || index < 0 || index >= layerCount()) {
         return false;
     }
     LayerProps clean = props;
+    if (clean.frame) {
+        clean.frame = sanitizedFrame(*clean.frame);
+    }
     // Float precision, as stored in project files (exact Save/Open round trip).
     clean.opacity = static_cast<float>(std::isfinite(clean.opacity) ? std::clamp(clean.opacity, 0.0, 1.0) : 1.0);
     for (Effect& e : clean.effects) {
@@ -391,7 +419,7 @@ bool Document::setLayerProps(int index, const LayerProps& props) {
                     layers_[static_cast<std::size_t>(index)].props = *after;
                     structureDirty_ = true;
                 }};
-    cmd.mergeLayer = index;
+    cmd.mergeLayer = mergeable ? index : -1;
     cmd.mergeAfter = after;
     execute(std::move(cmd));
     return true;
@@ -777,6 +805,119 @@ bool Document::fillSelected(Rgba8 color) {
     return endEdit(clear ? "Clear" : "Fill");
 }
 
+// ---------------------------------------------------------------- copy / paste
+
+TiledImage Document::copySelected(bool merged) const {
+    TiledImage src = merged ? flattenedImage() : activeLayer().image; // shares tiles
+    if (selection_.isEmpty()) {
+        return src;
+    }
+    TiledImage out(width_, height_);
+    const IRect area = *selection_.bounds();
+    for (int ty = area.y / kTile; ty <= (area.bottom() - 1) / kTile; ++ty) {
+        for (int tx = area.x / kTile; tx <= (area.right() - 1) / kTile; ++tx) {
+            const TiledImage::TilePtr tile = src.sharedTile(tx, ty);
+            if (!tile) {
+                continue; // nothing painted here
+            }
+            const IRect part = area.intersected({tx * kTile, ty * kTile, kTile, kTile});
+            for (int y = part.y; y < part.bottom(); ++y) {
+                for (int x = part.x; x < part.right(); ++x) {
+                    Rgba8 p = tile->pixels[static_cast<std::size_t>(TiledImage::pixelIndex(x, y))];
+                    const int c = selection_.coverage({x, y});
+                    if (p.a == 0 || c == 0) {
+                        continue;
+                    }
+                    p.a = static_cast<std::uint8_t>((p.a * c + 127) / 255);
+                    if (p.a != 0) {
+                        out.setPixel({x, y}, p);
+                    }
+                }
+            }
+        }
+    }
+    return out;
+}
+
+namespace {
+bool hasPixels(const TiledImage& image) {
+    for (int ty = 0; ty < image.tilesY(); ++ty) {
+        for (int tx = 0; tx < image.tilesX(); ++tx) {
+            if (image.sharedTile(tx, ty)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+} // namespace
+
+bool Document::layerFromSelection(bool cut) {
+    if (busy() || layerCount() >= kMaxLayers) {
+        return false;
+    }
+    TiledImage image = copySelected(false);
+    if (!hasPixels(image)) {
+        return false;
+    }
+    const std::string name = activeLayer().props.name + (cut ? " cut" : " copy");
+    if (!cut) {
+        return addLayer(name, std::move(image), "Layer via Copy");
+    }
+    if (editingMask_ || !eraseSelected()) {
+        return false; // locked, hidden or vector source: nothing changed
+    }
+    if (!addLayer(name, std::move(image), "Layer via Cut")) {
+        undo();
+        redo_.clear();
+        return false;
+    }
+    combineLastSteps(2, "Layer via Cut");
+    return true;
+}
+
+bool Document::pasteLayer(const std::string& name, TiledImage image) {
+    if (!hasPixels(image) || !addLayer(name, std::move(image), "Paste")) {
+        return false;
+    }
+    if (deselect()) {
+        combineLastSteps(2, "Paste");
+    }
+    return true;
+}
+
+void Document::combineLastSteps(std::size_t count, const std::string& label) {
+    if (count < 1 || undo_.size() < count) {
+        return;
+    }
+    std::vector<Command> steps;
+    for (std::size_t i = 0; i < count; ++i) {
+        steps.insert(steps.begin(), std::move(undo_.back()));
+        undo_.pop_back();
+    }
+    auto shared = std::make_shared<std::vector<Command>>(std::move(steps));
+    Command combined(
+        label,
+        [shared] {
+            for (auto it = shared->rbegin(); it != shared->rend(); ++it) {
+                it->undo();
+            }
+        },
+        [shared] {
+            for (Command& c : *shared) {
+                c.redo();
+            }
+        });
+    for (const Command& c : *shared) {
+        combined.bytes += c.bytes;
+    }
+    combined.frame = shared->front().frame;
+    undo_.push_back(std::move(combined));
+    if (cleanIndex_ > static_cast<long long>(undo_.size())) {
+        cleanIndex_ = -1;
+    }
+}
+
 // ---------------------------------------------------------------- transform
 
 void Document::restoreTiles(TiledImage& image, const std::vector<TiledImage::TilePtr>& from, IRect area) {
@@ -893,6 +1034,44 @@ bool Document::commitTransform(Interpolation interpolation, const std::string& l
                 }};
     cmd.bytes = bytes;
     execute(std::move(cmd));
+    return true;
+}
+
+bool Document::commitTransform(Interpolation interpolation, const std::string& label,
+                               const std::optional<LayerFrame>& frame) {
+    if (!transform_) {
+        return false;
+    }
+    const int layer = transform_->layer;
+    const std::size_t steps = undo_.size();
+    const bool pixels = commitTransform(interpolation, label);
+    const bool pixelStep = pixels && undo_.size() == steps + 1;
+    LayerProps props = layers_[static_cast<std::size_t>(layer)].props;
+    props.frame = frame ? sanitizedFrame(*frame) : std::nullopt;
+    const std::size_t before = undo_.size();
+    if (!setLayerPropsImpl(layer, props, false) || undo_.size() != before + 1) {
+        return pixels;
+    }
+    if (pixelStep) {
+        combineLastSteps(2, label);
+    } else {
+        combineLastSteps(1, "Set Anchor");
+    }
+    return true;
+}
+
+bool Document::transformLiftsWholeLayer() const {
+    if (!transform_) {
+        return false;
+    }
+    if (transform_->selectionBefore.isEmpty() || layers_[static_cast<std::size_t>(transform_->layer)].vector) {
+        return true;
+    }
+    for (const TiledImage::TilePtr& tile : transform_->hole) { // nothing may be left behind
+        if (tile && std::any_of(tile->pixels.begin(), tile->pixels.end(), [](const Rgba8& p) { return p.a != 0; })) {
+            return false;
+        }
+    }
     return true;
 }
 
@@ -1314,6 +1493,10 @@ bool Document::crop(IRect area) {
     cropped.reserve(layers_.size());
     for (const Layer& l : layers_) {
         Layer c(l.props, croppedImage(l.image, area));
+        if (c.props.frame) { // the box and anchor stay on the same pixels
+            c.props.frame->offset.x -= area.x;
+            c.props.frame->offset.y -= area.y;
+        }
         if (l.mask) {
             c.mask = croppedImage(*l.mask, area);
         }

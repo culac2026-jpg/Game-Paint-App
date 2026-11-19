@@ -499,11 +499,20 @@ void CanvasWidget::drawTransformBox(QPainter& p) const {
     drawAnts(p, lines, 0);
     p.setPen(QPen(Qt::black, 1.0));
     p.setBrush(Qt::white);
-    for (const QPointF& pt : c) {
-        p.drawRect(QRectF(pt.x() - 4, pt.y() - 4, 8, 8));
+    const bool edges = distance(c[0], c[1]) > 4 * kHandleRadius || distance(c[1], c[2]) > 4 * kHandleRadius;
+    for (std::size_t i = 0; i < (edges ? 8u : 4u); ++i) {
+        const double r = i < 4 ? 4.0 : 3.0;
+        p.drawRect(QRectF(c[i].x() - r, c[i].y() - r, 2 * r, 2 * r));
     }
-    const QPointF centre = (c[0] + c[2]) / 2.0;
-    p.drawEllipse(centre, 3.0, 3.0);
+    // The anchor: a target circle with a cross, rotation/scale pivot.
+    const QPointF a = toQt(viewport_.docToScreen(transformPivot()));
+    p.setBrush(Qt::NoBrush);
+    for (const auto& [colour, width] : {std::pair{QColor(Qt::black), 3.0}, std::pair{QColor(Qt::white), 1.0}}) {
+        p.setPen(QPen(colour, width));
+        p.drawEllipse(a, 6.0, 6.0);
+        p.drawLine(a + QPointF(-10, 0), a + QPointF(10, 0));
+        p.drawLine(a + QPointF(0, -10), a + QPointF(0, 10));
+    }
 }
 
 // ---------------------------------------------------------------- coordinates
@@ -593,24 +602,151 @@ void CanvasWidget::finishSelectionDrag(bool shift, bool alt) {
 
 gas::Affine CanvasWidget::transformMatrix() const {
     const TransformState& t = *transform_;
-    const gas::PointF c{t.source.x + t.source.w / 2.0, t.source.y + t.source.h / 2.0};
-    return gas::Affine::translate(c.x + t.offset.x, c.y + t.offset.y) * gas::Affine::rotate(t.angle) *
-           gas::Affine::scale(t.sx, t.sy) * gas::Affine::translate(-c.x, -c.y);
+    return gas::Affine::translate(t.pivot.x + t.offset.x, t.pivot.y + t.offset.y) * gas::Affine::rotate(t.angle) *
+           gas::Affine::scale(t.sx, t.sy) * gas::Affine::translate(-t.pivot.x, -t.pivot.y);
+}
+
+// Source-space positions of the 8 handles: corners TL TR BR BL, then edge
+// midpoints T R B L.
+std::array<gas::PointF, 8> CanvasWidget::transformHandlePoints() const {
+    const gas::RectF& r = transform_->source;
+    const double x0 = r.x, y0 = r.y, x1 = r.x + r.w, y1 = r.y + r.h;
+    const double mx = (x0 + x1) / 2.0, my = (y0 + y1) / 2.0;
+    return {{{x0, y0}, {x1, y0}, {x1, y1}, {x0, y1}, {mx, y0}, {x1, my}, {mx, y1}, {x0, my}}};
 }
 
 std::vector<QPointF> CanvasWidget::transformCorners() const {
     const gas::Affine m = transformMatrix();
-    const gas::IRect& r = transform_->source;
-    const gas::PointF pts[4] = {{double(r.x), double(r.y)},
-                                {double(r.right()), double(r.y)},
-                                {double(r.right()), double(r.bottom())},
-                                {double(r.x), double(r.bottom())}};
+    const auto pts = transformHandlePoints();
     std::vector<QPointF> out;
     for (const gas::PointF& pt : pts) {
         out.push_back(toQt(viewport_.docToScreen(m.map(pt))));
     }
-    return out;
+    return out; // 8 points; the first 4 are the box corners
 }
+
+gas::PointF CanvasWidget::transformPivot() const {
+    const TransformState& t = *transform_;
+    return {t.pivot.x + t.offset.x, t.pivot.y + t.offset.y}; // M(pivot)
+}
+
+int CanvasWidget::transformHandleAt(QPointF pos) const {
+    const std::vector<QPointF> c = transformCorners();
+    // A box too small on screen keeps only its corners grabbable.
+    const bool edges = distance(c[0], c[1]) > 4 * kHandleRadius || distance(c[1], c[2]) > 4 * kHandleRadius;
+    int best = -1;
+    double bestDist = kHandleRadius;
+    for (int i = 0; i < (edges ? 8 : 4); ++i) {
+        const double d = distance(pos, c[static_cast<std::size_t>(i)]);
+        if (d <= bestDist) {
+            best = i;
+            bestDist = d;
+        }
+    }
+    return best;
+}
+
+bool CanvasWidget::nearTransformPivot(QPointF pos) const {
+    return distance(pos, toQt(viewport_.docToScreen(transformPivot()))) <= kHandleRadius;
+}
+
+void CanvasWidget::setTransformPivot(gas::PointF doc) {
+    if (transform_) {
+        pushTransformUndo();
+        movePivotTo(doc);
+    }
+}
+
+void CanvasWidget::movePivotTo(gas::PointF doc) {
+    // Moving the anchor never moves the pixels: pick the source point under
+    // `doc` and re-solve the offset so the mapping stays the same.
+    TransformState& t = *transform_;
+    const gas::PointF src = transformMatrix().inverted().map(doc);
+    t.pivot = src;
+    t.offset = {doc.x - src.x, doc.y - src.y};
+    applyTransform();
+}
+
+void CanvasWidget::centerTransformPivot() {
+    if (!transform_) {
+        return;
+    }
+    const gas::RectF& r = transform_->source;
+    setTransformPivot(transformMatrix().map({r.x + r.w / 2.0, r.y + r.h / 2.0}));
+}
+
+CanvasWidget::TransformParams CanvasWidget::transformParams() const {
+    const TransformState& t = *transform_;
+    return {t.pivot, t.offset, t.angle, t.sx, t.sy};
+}
+
+void CanvasWidget::restoreTransformParams(const TransformParams& p) {
+    TransformState& t = *transform_;
+    t.pivot = p.pivot;
+    t.offset = p.offset;
+    t.angle = p.angle;
+    t.sx = p.sx;
+    t.sy = p.sy;
+    applyTransform();
+}
+
+void CanvasWidget::pushTransformUndo() {
+    const TransformParams now = transformParams();
+    if (transformUndo_.empty() || !(transformUndo_.back() == now)) {
+        transformUndo_.push_back(now);
+    }
+    transformRedo_.clear();
+}
+
+bool CanvasWidget::undoTransformStep() {
+    if (!transform_ || transform_->drag != TransformState::Drag::None) {
+        return transform_.has_value() && transform_->drag != TransformState::Drag::None;
+    }
+    while (!transformUndo_.empty()) {
+        const TransformParams p = transformUndo_.back();
+        transformUndo_.pop_back();
+        if (p == transformParams()) {
+            continue; // an entry that changed nothing
+        }
+        transformRedo_.push_back(transformParams());
+        restoreTransformParams(p);
+        return true;
+    }
+    return false;
+}
+
+bool CanvasWidget::redoTransformStep() {
+    if (!transform_ || transform_->drag != TransformState::Drag::None || transformRedo_.empty()) {
+        return false;
+    }
+    transformUndo_.push_back(transformParams());
+    const TransformParams p = transformRedo_.back();
+    transformRedo_.pop_back();
+    restoreTransformParams(p);
+    return true;
+}
+
+void CanvasWidget::setTransformAngle(double degrees) {
+    if (transform_) {
+        pushTransformUndo();
+        transform_->angle = degrees * std::numbers::pi / 180.0;
+        applyTransform();
+    }
+}
+
+void CanvasWidget::setTransformScale(double sx, double sy) {
+    if (transform_) {
+        const auto clampScale = [](double s) { return std::abs(s) < kMinScale ? (s < 0 ? -kMinScale : kMinScale) : s; };
+        pushTransformUndo();
+        transform_->sx = clampScale(sx);
+        transform_->sy = clampScale(sy);
+        applyTransform();
+    }
+}
+
+double CanvasWidget::transformAngle() const { return transform_ ? transform_->angle * 180.0 / std::numbers::pi : 0.0; }
+double CanvasWidget::transformScaleX() const { return transform_ ? transform_->sx : 1.0; }
+double CanvasWidget::transformScaleY() const { return transform_ ? transform_->sy : 1.0; }
 
 bool CanvasWidget::beginFreeTransform() {
     if (!document_ || transform_) {
@@ -626,24 +762,77 @@ bool CanvasWidget::beginFreeTransform() {
         return false;
     }
     transform_ = TransformState{};
-    transform_->source = document_->transformSourceRect();
+    transformUndo_.clear();
+    transformRedo_.clear();
+    TransformState& t = *transform_;
+    const gas::IRect lifted = document_->transformSourceRect();
+    t.source = {double(lifted.x), double(lifted.y), double(lifted.w), double(lifted.h)};
+    t.pivot = {lifted.x + lifted.w / 2.0, lifted.y + lifted.h / 2.0};
+    t.wholeLayer = document_->transformLiftsWholeLayer();
+    const auto& frame = document_->activeLayer().props.frame;
+    if (t.wholeLayer && frame) {
+        t.hadFrame = true;
+        // Start from the remembered box when the content still fits in it;
+        // otherwise (painted outside it since) a fresh box keeps the anchor.
+        const gas::Affine inv = frame->matrix().inverted();
+        const gas::RectF& fr = frame->rect;
+        const gas::PointF box[4] = {{fr.x, fr.y}, {fr.x + fr.w, fr.y}, {fr.x + fr.w, fr.y + fr.h}, {fr.x, fr.y + fr.h}};
+        double minX = 1e300, minY = 1e300, maxX = -1e300, maxY = -1e300;
+        for (const gas::PointF& corner : box) {
+            const gas::PointF q = frame->matrix().map(corner);
+            minX = std::min(minX, q.x);
+            minY = std::min(minY, q.y);
+            maxX = std::max(maxX, q.x);
+            maxY = std::max(maxY, q.y);
+        }
+        // The content must lie within the box's on-canvas bounds (2 px slack for resampling).
+        const bool fits = lifted.x >= minX - 2 && lifted.y >= minY - 2 && lifted.right() <= maxX + 2 &&
+                          lifted.bottom() <= maxY + 2;
+        if (fits) {
+            t.source = fr;
+            t.pivot = frame->pivot;
+            t.offset = frame->offset;
+            t.angle = frame->angle;
+            t.sx = frame->sx;
+            t.sy = frame->sy;
+            t.restInverse = inv;
+        } else {
+            t.pivot = frame->anchor();
+        }
+    }
     updateCursorShape();
     update();
     Q_EMIT transformModeChanged(true);
+    Q_EMIT transformChanged();
     return true;
 }
 
 void CanvasWidget::applyTransform() {
-    document_->setTransform(transformMatrix());
+    document_->setTransform(transformMatrix() * transform_->restInverse);
     update();
+    Q_EMIT transformChanged();
 }
 
 void CanvasWidget::commitTransform() {
     if (!transform_) {
         return;
     }
+    const TransformState t = *transform_;
     transform_.reset();
-    document_->commitTransform(interpolation_);
+    transformUndo_.clear();
+    transformRedo_.clear();
+    // Whole-layer transforms remember the box and anchor on the layer, once it
+    // has a frame or the anchor/rotation/scale was set (plain moves of a layer
+    // without one don't create it).
+    const gas::PointF centre{t.source.x + t.source.w / 2.0, t.source.y + t.source.h / 2.0};
+    const bool shaped = t.angle != 0.0 || t.sx != 1.0 || t.sy != 1.0 ||
+                        std::abs(t.pivot.x - centre.x) > 1e-9 || std::abs(t.pivot.y - centre.y) > 1e-9;
+    if (t.wholeLayer && (t.hadFrame || shaped)) {
+        document_->commitTransform(interpolation_, "Transform",
+                                   gas::LayerFrame{t.source, t.pivot, t.offset, t.angle, t.sx, t.sy});
+    } else {
+        document_->commitTransform(interpolation_);
+    }
     updateCursorShape();
     update();
     Q_EMIT transformModeChanged(false);
@@ -655,6 +844,8 @@ void CanvasWidget::cancelTransform() {
         return;
     }
     transform_.reset();
+    transformUndo_.clear();
+    transformRedo_.clear();
     document_->cancelTransform();
     updateCursorShape();
     update();
@@ -670,13 +861,11 @@ void CanvasWidget::transformPress(QPointF pos, Qt::KeyboardModifiers) {
     t.angle0 = t.angle;
     t.sx0 = t.sx;
     t.sy0 = t.sy;
-    t.corner = -1;
-    for (int i = 0; i < 4; ++i) {
-        if (distance(pos, c[static_cast<std::size_t>(i)]) <= kHandleRadius) {
-            t.corner = i;
-        }
-    }
-    if (t.corner >= 0) {
+    t.handle = transformHandleAt(pos);
+    pushTransformUndo(); // dropped again by undo if the drag changed nothing
+    if (nearTransformPivot(pos)) {
+        t.drag = TransformState::Drag::Pivot; // the anchor wins over a handle under it
+    } else if (t.handle >= 0) {
         t.drag = TransformState::Drag::Scale;
     } else if (QPolygonF({c[0], c[1], c[2], c[3]}).containsPoint(pos, Qt::OddEvenFill)) {
         t.drag = TransformState::Drag::Move;
@@ -688,16 +877,41 @@ void CanvasWidget::transformPress(QPointF pos, Qt::KeyboardModifiers) {
 void CanvasWidget::transformDrag(QPointF pos, Qt::KeyboardModifiers mods) {
     TransformState& t = *transform_;
     const gas::PointF doc = docAt(pos);
-    const gas::PointF centre{t.source.x + t.source.w / 2.0 + t.offset0.x, t.source.y + t.source.h / 2.0 + t.offset0.y};
+    // Rotation and scaling happen around the anchor.
+    const gas::PointF anchor{t.pivot.x + t.offset0.x, t.pivot.y + t.offset0.y};
     switch (t.drag) {
     case TransformState::Drag::None: return;
+    case TransformState::Drag::Pivot: {
+        gas::PointF target{std::round(doc.x * 2.0) / 2.0, std::round(doc.y * 2.0) / 2.0}; // half pixels
+        if (mods & Qt::ShiftModifier) {
+            // Snap to the nearest corner, edge middle or centre of the box.
+            const gas::Affine m = transformMatrix();
+            const gas::RectF& r = t.source;
+            auto pts = transformHandlePoints();
+            double best = 1e300;
+            const auto consider = [&](gas::PointF src) {
+                const gas::PointF q = m.map(src);
+                const double d = std::hypot(q.x - doc.x, q.y - doc.y);
+                if (d < best) {
+                    best = d;
+                    target = q;
+                }
+            };
+            for (const gas::PointF& p : pts) {
+                consider(p);
+            }
+            consider({r.x + r.w / 2.0, r.y + r.h / 2.0});
+        }
+        movePivotTo(target);
+        return;
+    }
     case TransformState::Drag::Move:
         // Whole-pixel moves keep pixel art exact.
         t.offset = {t.offset0.x + std::round(doc.x - t.startDoc.x), t.offset0.y + std::round(doc.y - t.startDoc.y)};
         break;
     case TransformState::Drag::Rotate: {
-        const double a0 = std::atan2(t.startDoc.y - centre.y, t.startDoc.x - centre.x);
-        const double a1 = std::atan2(doc.y - centre.y, doc.x - centre.x);
+        const double a0 = std::atan2(t.startDoc.y - anchor.y, t.startDoc.x - anchor.x);
+        const double a1 = std::atan2(doc.y - anchor.y, doc.x - anchor.x);
         t.angle = t.angle0 + (a1 - a0);
         if (mods & Qt::ShiftModifier) {
             const double step = std::numbers::pi / 12.0; // 15 degrees
@@ -706,18 +920,29 @@ void CanvasWidget::transformDrag(QPointF pos, Qt::KeyboardModifiers mods) {
         break;
     }
     case TransformState::Drag::Scale: {
-        // Scale about the centre, measured along the box's own (rotated) axes.
-        const double dx = doc.x - centre.x, dy = doc.y - centre.y;
+        // The grabbed handle follows the pointer, measured along the box's own
+        // (rotated) axes from the anchor. An axis on which the handle sits at the
+        // anchor (or an edge handle's other axis) keeps its scale.
+        const double dx = doc.x - anchor.x, dy = doc.y - anchor.y;
         const double cs = std::cos(-t.angle), sn = std::sin(-t.angle);
         const double lx = cs * dx - sn * dy, ly = sn * dx + cs * dy;
-        static constexpr int signX[4] = {-1, 1, 1, -1};
-        static constexpr int signY[4] = {-1, -1, 1, 1};
-        double sx = lx / (signX[t.corner] * t.source.w / 2.0);
-        double sy = ly / (signY[t.corner] * t.source.h / 2.0);
+        const gas::PointF h = transformHandlePoints()[static_cast<std::size_t>(t.handle)];
+        const double rx = h.x - t.pivot.x, ry = h.y - t.pivot.y;
+        const bool useX = t.handle != 4 && t.handle != 6 && std::abs(rx) > 0.5;
+        const bool useY = t.handle != 5 && t.handle != 7 && std::abs(ry) > 0.5;
+        double sx = useX ? lx / rx : t.sx0;
+        double sy = useY ? ly / ry : t.sy0;
         if (mods & Qt::ShiftModifier) { // keep the aspect ratio
-            const double k = (std::abs(sx / t.sx0) + std::abs(sy / t.sy0)) / 2.0;
-            sx = t.sx0 * k * (sx < 0 ? -1 : 1) * (t.sx0 < 0 ? -1 : 1);
-            sy = t.sy0 * k * (sy < 0 ? -1 : 1) * (t.sy0 < 0 ? -1 : 1);
+            double k = 1.0;
+            if (useX && useY) {
+                k = (std::abs(sx / t.sx0) + std::abs(sy / t.sy0)) / 2.0;
+            } else if (useX) {
+                k = std::abs(sx / t.sx0);
+            } else if (useY) {
+                k = std::abs(sy / t.sy0);
+            }
+            sx = std::abs(t.sx0) * k * ((useX ? sx : t.sx0) < 0 ? -1 : 1);
+            sy = std::abs(t.sy0) * k * ((useY ? sy : t.sy0) < 0 ? -1 : 1);
         }
         const auto clampScale = [](double s) { return std::abs(s) < kMinScale ? (s < 0 ? -kMinScale : kMinScale) : s; };
         t.sx = clampScale(sx);
@@ -1088,10 +1313,10 @@ void CanvasWidget::keyPressEvent(QKeyEvent* event) {
         case Qt::Key_Return:
         case Qt::Key_Enter: commitTransform(); return;
         case Qt::Key_Escape: cancelTransform(); return;
-        case Qt::Key_Left: transform_->offset.x -= step; applyTransform(); return;
-        case Qt::Key_Right: transform_->offset.x += step; applyTransform(); return;
-        case Qt::Key_Up: transform_->offset.y -= step; applyTransform(); return;
-        case Qt::Key_Down: transform_->offset.y += step; applyTransform(); return;
+        case Qt::Key_Left: pushTransformUndo(); transform_->offset.x -= step; applyTransform(); return;
+        case Qt::Key_Right: pushTransformUndo(); transform_->offset.x += step; applyTransform(); return;
+        case Qt::Key_Up: pushTransformUndo(); transform_->offset.y -= step; applyTransform(); return;
+        case Qt::Key_Down: pushTransformUndo(); transform_->offset.y += step; applyTransform(); return;
         default: break;
         }
     } else if (sliceDrag_ && event->key() == Qt::Key_Escape) {
@@ -1151,15 +1376,19 @@ void CanvasWidget::updateCursorShape() {
         setCursor(Qt::OpenHandCursor);
     } else if (transform_) {
         Qt::CursorShape shape = Qt::PointingHandCursor; // outside the box: rotate
-        if (cursorPos_) {
+        if (transform_->drag == TransformState::Drag::Pivot) {
+            shape = Qt::CrossCursor;
+        } else if (cursorPos_) {
             const std::vector<QPointF> c = transformCorners();
             if (QPolygonF({c[0], c[1], c[2], c[3]}).containsPoint(*cursorPos_, Qt::OddEvenFill)) {
                 shape = Qt::SizeAllCursor;
             }
-            for (const QPointF& pt : c) {
-                if (distance(*cursorPos_, pt) <= kHandleRadius) {
-                    shape = Qt::SizeFDiagCursor;
-                }
+            const int h = transformHandleAt(*cursorPos_);
+            if (h >= 0) {
+                shape = h < 4 ? Qt::SizeFDiagCursor : (h == 4 || h == 6) ? Qt::SizeVerCursor : Qt::SizeHorCursor;
+            }
+            if (nearTransformPivot(*cursorPos_)) {
+                shape = Qt::CrossCursor;
             }
         }
         setCursor(shape);

@@ -16,6 +16,8 @@ add_executable(gas_core_tests
     ViewportTest.cpp
     BlendTest.cpp
     BrushTest.cpp
+    ClipboardTest.cpp
+    LayerFrameTest.cpp
     FillTest.cpp
     DocumentTest.cpp
     ProjectIOTest.cpp

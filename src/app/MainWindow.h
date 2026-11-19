@@ -24,6 +24,7 @@ class VectorOptions;
 class QAction;
 class QCheckBox;
 class QComboBox;
+class QDoubleSpinBox;
 class QDockWidget;
 class QLabel;
 class QLockFile;
@@ -73,6 +74,11 @@ private:
     void exportLayers();
     void exportFrames();
     void exportSvg();
+    // Clipboard: the selected pixels (or the whole layer) as an image that keeps
+    // its canvas position; Paste makes a new layer.
+    void copySelection(bool merged, bool cut);
+    void paste();
+    void layerFromSelection(bool cut);
     // Crash recovery: autosave the document into this session's slot.
     void autosave();
     void clearAutosave();
@@ -159,6 +165,13 @@ private:
     QCheckBox* antialiasBox_ = nullptr;
     QList<QAction*> selectionOptionActions_; // shown for selection tools
     QComboBox* interpolationBox_ = nullptr;
+    // Transform fields: angle (deg), scale (%), anchor position (canvas px).
+    QDoubleSpinBox* xfAngleBox_ = nullptr;
+    QDoubleSpinBox* xfScaleXBox_ = nullptr;
+    QDoubleSpinBox* xfScaleYBox_ = nullptr;
+    QDoubleSpinBox* xfPivotXBox_ = nullptr;
+    QDoubleSpinBox* xfPivotYBox_ = nullptr;
+    void syncTransformFields();
     QList<QAction*> transformOptionActions_; // shown for Move / while transforming
     QList<QAction*> transformApplyActions_;  // shown while transforming
 };

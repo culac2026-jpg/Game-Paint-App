@@ -57,6 +57,7 @@ struct RectF {
     double y = 0.0;
     double w = 0.0;
     double h = 0.0;
+    friend bool operator==(const RectF&, const RectF&) = default;
 };
 
 // 2D affine map:  x' = a*x + c*y + tx,  y' = b*x + d*y + ty.

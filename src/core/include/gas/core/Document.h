@@ -17,6 +17,29 @@
 
 namespace gas {
 
+// A layer's remembered transform box and anchor (e.g. a body part cut out to
+// its own layer, with the anchor on its joint). The box is `rect` mapped by
+// matrix() = T(pivot + offset) * R(angle) * S(sx, sy) * T(-pivot); the anchor
+// shows at pivot + offset. Free transforms of the whole layer start from it and
+// store it back, so the box keeps its rotation/scale and the anchor its place.
+struct LayerFrame {
+    RectF rect;      // the box before matrix()
+    PointF pivot{};  // anchor in the box's own space
+    PointF offset{}; // where the anchor moved to (anchor = pivot + offset)
+    double angle = 0.0; // radians
+    double sx = 1.0, sy = 1.0;
+
+    Affine matrix() const {
+        return Affine::translate(pivot.x + offset.x, pivot.y + offset.y) * Affine::rotate(angle) *
+               Affine::scale(sx, sy) * Affine::translate(-pivot.x, -pivot.y);
+    }
+    PointF anchor() const { return {pivot.x + offset.x, pivot.y + offset.y}; }
+    friend bool operator==(const LayerFrame&, const LayerFrame&) = default;
+};
+
+// Finite, bounded values (scales at least 0.01 in size), or nullopt if unusable.
+std::optional<LayerFrame> sanitizedFrame(const LayerFrame& frame);
+
 struct LayerProps {
     std::string name;
     bool visible = true;
@@ -25,6 +48,7 @@ struct LayerProps {
     bool maskEnabled = true; // ignored when the layer has no mask
     BlendMode blendMode = BlendMode::Normal;
     std::vector<Effect> effects; // non-destructive effect stack (see Effects.h)
+    std::optional<LayerFrame> frame; // remembered transform box + anchor
 
     friend bool operator==(const LayerProps&, const LayerProps&) = default;
 };
@@ -197,6 +221,19 @@ public:
     bool eraseSelected();
     bool fillSelected(Rgba8 color);
 
+    // --- Copy / cut / paste ---
+    // The selected pixels of the active layer (merged: of the composite of the
+    // active frame), alpha scaled by the selection coverage; everything when
+    // nothing is selected. Document-sized, pixels stay where they are.
+    TiledImage copySelected(bool merged = false) const;
+    // New layer above the active one holding the selected pixels, as one undo
+    // step. cut: the pixels are also erased from the source layer, which must be
+    // an editable raster layer. False if nothing would be copied.
+    bool layerFromSelection(bool cut);
+    // Adds `image` (document-sized) as a new layer above the active one and
+    // drops the selection, as one undo step "Paste".
+    bool pasteLayer(const std::string& name, TiledImage image);
+
     // --- Transform of the selected pixels (or the whole layer) ---
     // Lifts the content out of the active layer into a floating image; the
     // preview updates with setTransform() until commit or cancel. On a vector
@@ -209,6 +246,13 @@ public:
     void setTransform(const Affine& m);
     // One undo step (pixels + selection). An identity transform cancels instead.
     bool commitTransform(Interpolation interpolation, const std::string& label = "Transform");
+    // The same, also storing `frame` as the layer's LayerFrame in that step.
+    // When the pixels don't change but the frame does (only the anchor moved),
+    // the step is just the frame ("Set Anchor"). True if anything changed.
+    bool commitTransform(Interpolation interpolation, const std::string& label, const std::optional<LayerFrame>& frame);
+    // True while transforming if every pixel of the layer was lifted (no
+    // selection, or one that covers all its content): the layer frame applies.
+    bool transformLiftsWholeLayer() const;
     void cancelTransform();
     // One-shot helpers (begin, set, commit); exact for pixel art.
     bool flipContent(bool horizontal);
@@ -370,6 +414,9 @@ private:
     // Applies `cmd` (runs redo) and records it.
     void execute(Command cmd);
     void enforceHistoryLimit();
+    bool setLayerPropsImpl(int index, const LayerProps& props, bool mergeable);
+    // Folds the newest `count` undo steps into one step called `label` (1 = rename).
+    void combineLastSteps(std::size_t count, const std::string& label);
     std::string nextLayerName() const;
     std::vector<Slice> sanitizedSlices(std::vector<Slice> slices) const;
     // Tiles of `image` that differ in content from `before`.
